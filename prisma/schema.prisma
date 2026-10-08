@@ -1,0 +1,262 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── SaaS Platform Layer ───────────────────────────
+
+model Plan {
+  id           String   @id @default(cuid())
+  name         String
+  slug         String   @unique
+  tagline      String?
+  priceMonthly Int      @default(0) // تومان
+  maxBranches  Int      @default(1)
+  maxStaff     Int      @default(1)
+  maxBookings  Int      @default(100) // per month
+  smsQuota     Int      @default(50) // per month
+  features     String   @default("[]") // JSON array of feature flags
+  isPopular    Boolean  @default(false)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  tenants      Tenant[]
+}
+
+model Tenant {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String   @unique
+  status        String   @default("ACTIVE") // ACTIVE | SUSPENDED | PENDING
+  category      String   @default("خدمات")
+  logoText      String   @default("NB")
+  phone         String?
+  address       String?
+  timezone      String   @default("Asia/Tehran")
+  locale        String   @default("fa")
+  planId        String?
+  plan          Plan?    @relation(fields: [planId], references: [id])
+  smsProvider   String   @default("کاوه‌نگار")
+  // notification policy JSON: {smsOnQueueChange,smsOnReschedule,smsOnCancel,smsBeforeTurn,minorThreshold}
+  notifPolicy   String   @default("{}")
+  // cancellation policy JSON: {allowCustomerCancel, minMinutesBefore, sendCancelSms}
+  cancelPolicy  String   @default("{}")
+  queuePrefix   String   @default("A")
+  reasonRequired Boolean @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  users         User[]
+  branches      Branch[]
+  services      Service[]
+  staff         Staff[]
+  customers     Customer[]
+  appointments  Appointment[]
+  queues        Queue[]
+  notifications Notification[]
+  tickets       Ticket[]
+  auditLogs     AuditLog[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String?
+  tenant       Tenant?  @relation(fields: [tenantId], references: [id])
+  name         String
+  email        String   @unique
+  mobile       String?
+  passwordHash String
+  // SUPER_ADMIN | SUPPORT | TENANT_OWNER | TENANT_ADMIN | MANAGER | OPERATOR | STAFF
+  role         String   @default("STAFF")
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now())
+}
+
+// ─────────────────────────── Business Layer ───────────────────────────
+
+model Branch {
+  id       String  @id @default(cuid())
+  tenantId String
+  tenant   Tenant  @relation(fields: [tenantId], references: [id])
+  name     String
+  address  String?
+  phone    String?
+  // JSON: {"sat":{"open":"09:00","close":"18:00","closed":false}, ...}
+  hours    String  @default("{}")
+  status   String  @default("ACTIVE")
+
+  services     Service[]
+  staff        Staff[]
+  appointments Appointment[]
+  queues       Queue[]
+}
+
+model Service {
+  id          String  @id @default(cuid())
+  tenantId    String
+  tenant      Tenant  @relation(fields: [tenantId], references: [id])
+  branchId    String?
+  branch      Branch? @relation(fields: [branchId], references: [id])
+  name        String
+  description String?
+  duration    Int     @default(30) // minutes
+  price       Int     @default(0) // تومان
+  capacity    Int     @default(1)
+  status      String  @default("ACTIVE")
+
+  appointments Appointment[]
+  queues       Queue[]
+}
+
+model Staff {
+  id         String  @id @default(cuid())
+  tenantId   String
+  tenant     Tenant  @relation(fields: [tenantId], references: [id])
+  branchId   String?
+  branch     Branch? @relation(fields: [branchId], references: [id])
+  name       String
+  title      String?
+  serviceIds String  @default("[]") // JSON array of Service ids
+  status     String  @default("ACTIVE")
+
+  appointments Appointment[]
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  name      String
+  mobile    String
+  email     String?
+  note      String?
+  createdAt DateTime @default(now())
+
+  appointments Appointment[]
+
+  @@unique([tenantId, mobile])
+}
+
+// ─────────────────────────── Appointment & Queue Engines ───────────────────────────
+
+model Appointment {
+  id           String    @id @default(cuid())
+  tenantId     String
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  branchId     String
+  branch       Branch    @relation(fields: [branchId], references: [id])
+  serviceId    String
+  service      Service   @relation(fields: [serviceId], references: [id])
+  staffId      String?
+  staff        Staff?    @relation(fields: [staffId], references: [id])
+  customerId   String
+  customer     Customer  @relation(fields: [customerId], references: [id])
+  code         String    @unique // A-124
+  scheduledAt  DateTime
+  durationMin  Int       @default(30)
+  // PENDING CONFIRMED WAITING CALLED IN_SERVICE COMPLETED CANCELLED NO_SHOW SKIPPED
+  status       String    @default("CONFIRMED")
+  // ONLINE | WALK_IN | PHONE
+  source       String    @default("ONLINE")
+  // NORMAL | PRIORITY | VIP | EMERGENCY
+  priority     String    @default("NORMAL")
+  liveToken    String    @unique
+  idempotencyKey String? @unique
+  note         String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  queueEntry QueueEntry?
+  notifications Notification[]
+}
+
+model Queue {
+  id             String   @id @default(cuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  branchId       String
+  branch         Branch   @relation(fields: [branchId], references: [id])
+  serviceId      String
+  service        Service  @relation(fields: [serviceId], references: [id])
+  date           String // "2026-10-08"
+  // OPEN | PAUSED | CLOSED
+  status         String   @default("OPEN")
+  currentServing String?
+  avgServiceMin  Int      @default(15)
+  openedAt       DateTime @default(now())
+
+  entries QueueEntry[]
+
+  @@unique([branchId, serviceId, date])
+}
+
+model QueueEntry {
+  id            String    @id @default(cuid())
+  queueId       String
+  queue         Queue     @relation(fields: [queueId], references: [id])
+  appointmentId String    @unique
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  position      Int
+  // WAITING CALLED IN_SERVICE COMPLETED SKIPPED CANCELLED NO_SHOW
+  status        String    @default("WAITING")
+  priority      String    @default("NORMAL")
+  note          String?
+  joinedAt      DateTime  @default(now())
+  calledAt      DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+}
+
+// ─────────────────────────── Notification Engine ───────────────────────────
+
+model Notification {
+  id                String    @id @default(cuid())
+  tenantId          String
+  tenant            Tenant    @relation(fields: [tenantId], references: [id])
+  appointmentId     String?
+  appointment       Appointment? @relation(fields: [appointmentId], references: [id])
+  channel           String    @default("SMS")
+  // BOOKING_CREATED | QUEUE_CHANGED | RESCHEDULED | CANCELLED | YOUR_TURN | CALLED | NO_SHOW
+  type              String
+  recipient         String
+  body              String
+  // PENDING | SENT | FAILED
+  status            String    @default("PENDING")
+  providerMessageId String?
+  createdAt         DateTime  @default(now())
+  sentAt            DateTime?
+}
+
+// ─────────────────────────── Support & Audit ───────────────────────────
+
+model Ticket {
+  id        String   @id @default(cuid())
+  tenantId  String?
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id])
+  createdBy String
+  subject   String
+  body      String
+  // LOW NORMAL HIGH URGENT
+  priority  String   @default("NORMAL")
+  // OPEN IN_PROGRESS WAITING_FOR_CUSTOMER RESOLVED CLOSED
+  status    String   @default("OPEN")
+  assignee  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String?
+  tenant     Tenant?  @relation(fields: [tenantId], references: [id])
+  actor      String
+  role       String?
+  action     String
+  entityType String
+  entityId   String?
+  detail     String?
+  createdAt  DateTime @default(now())
+}
