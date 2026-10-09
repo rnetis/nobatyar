@@ -1,7 +1,7 @@
-import { createHmac, timingSafeEqual, createHash } from 'crypto'
+import { createHmac, timingSafeEqual } from 'crypto'
 import { cookies } from 'next/headers'
 
-const SECRET = process.env.SESSION_SECRET || 'nobaas-dev-secret-1404'
+const SECRET = process.env.SESSION_SECRET
 const COOKIE_NAME = 'nobaas_sess'
 
 export interface SessionPayload {
@@ -14,11 +14,13 @@ export interface SessionPayload {
 }
 
 function sign(data: string): string {
+  if (!SECRET) throw new Error('SESSION_SECRET is not configured')
   return createHmac('sha256', SECRET).update(data).digest('base64url')
 }
 
 export function hashPassword(password: string): string {
-  return createHash('sha256').update(`nobaas:${password}`).digest('hex')
+  const salt = createHmac('sha256', 'nobaas:pwd-salt').update('static-v1').digest('hex').slice(0, 32)
+  return createHmac('sha256', salt).update(`nobaas:${password}`).digest('hex')
 }
 
 export function createSessionToken(payload: SessionPayload): string {

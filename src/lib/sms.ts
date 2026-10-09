@@ -3,9 +3,16 @@ import { formatJalaliFull, formatTime, faDigits, minutesFa } from '@/lib/jalali'
 
 /**
  * Notification Engine (PRD §19–21, §44)
- * Transactional Outbox: notifications are persisted first, a worker-ish
- * flush marks them SENT (simulated provider). SMS must never block booking.
+ * Transactional Outbox: notifications are persisted first, then delivered via:
+ *  1. sms.ir bulk SMS API  (SMSIR_API_KEY + SMSIR_LINE_NUMBER)
+ *  2. an optional webhook  (NOTIFICATION_WEBHOOK_URL) — POST JSON, signed with
+ *     NOTIFICATION_WEBHOOK_SECRET when provided
+ * Delivery is fire-and-forget: SMS must never block or fail a booking.
+ * Without credentials, messages stay PENDING in the outbox (visible in the
+ * business panel SMS log) instead of being marked sent.
  */
+
+const SMSIR_API_URL = 'https://api.sms.ir/v1/send/bulk'
 
 export type NotificationType =
   | 'BOOKING_CREATED'
@@ -135,12 +142,120 @@ export async function queueNotification(args: {
         status: 'PENDING',
       },
     })
-    // Simulated provider flush (outbox worker)
-    await db.notification.update({
-      where: { id: created.id },
-      data: { status: 'SENT', sentAt: new Date(), providerMessageId: `sim-${created.id.slice(-8)}` },
-    })
+
+    // Deliver via sms.ir + optional webhook (outbox worker flush)
+    const [smsResult] = await Promise.allSettled([
+      sendViaSmsIr({ recipient: args.recipient, messageText: body }),
+      sendViaWebhook({ notification: created, tenantId: args.tenantId, type: args.type }),
+    ])
+
+    const sms = smsResult.status === 'fulfilled' ? smsResult.value : { ok: false as const, configured: true, error: String(smsResult.reason) }
+    if (sms.ok) {
+      await db.notification.update({
+        where: { id: created.id },
+        data: { status: 'SENT', sentAt: new Date(), providerMessageId: sms.messageId },
+      })
+    } else if (sms.configured) {
+      // provider was configured but delivery failed → mark FAILED for retry/inspection
+      await db.notification.update({
+        where: { id: created.id },
+        data: { status: 'FAILED' },
+      })
+      console.error('sms delivery failed', sms.error)
+    }
+    // not configured → stays PENDING in the outbox (visible in the SMS log)
   } catch (e) {
     console.error('notification error', e)
+  }
+}
+
+interface SmsIrResult {
+  ok: boolean
+  configured: boolean
+  messageId?: string
+  error?: string
+}
+
+/**
+ * Send an SMS via the sms.ir bulk API.
+ * Requires SMSIR_API_KEY and SMSIR_LINE_NUMBER env vars; when either is
+ * missing the message is left in the outbox (PENDING) and nothing is sent.
+ * Docs: https://documenter.getpostman.com/view/5019639/2sA35D6aM2 (sms.ir v1)
+ */
+async function sendViaSmsIr(args: {
+  recipient: string
+  messageText: string
+}): Promise<SmsIrResult> {
+  const apiKey = process.env.SMSIR_API_KEY
+  const lineNumber = process.env.SMSIR_LINE_NUMBER
+  if (!apiKey || !lineNumber) {
+    return { ok: false, configured: false, error: 'SMSIR_API_KEY / SMSIR_LINE_NUMBER not configured — kept in outbox' }
+  }
+  try {
+    const res = await fetch(SMSIR_API_URL, {
+      method: 'POST',
+      headers: {
+        'X-API-KEY': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        lineNumber: Number(lineNumber),
+        messageText: args.messageText,
+        mobiles: [args.recipient],
+        sendDateTime: null,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const json = (await res.json().catch(() => null)) as { status?: number; message?: string; data?: { id?: number | string; packagedMessageId?: number | string } } | null
+    if (!res.ok || !json || (typeof json.status === 'number' && json.status !== 1)) {
+      return { ok: false, configured: true, error: `sms.ir error ${res.status}: ${JSON.stringify(json)}` }
+    }
+    return { ok: true, configured: true, messageId: String(json.data?.id ?? json.data?.packagedMessageId ?? crypto.randomUUID()) }
+  } catch (e) {
+    return { ok: false, configured: true, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/**
+ * Optional generic webhook: POSTs the notification payload as JSON to
+ * NOTIFICATION_WEBHOOK_URL. When NOTIFICATION_WEBHOOK_SECRET is set, the
+ * request carries an X-Nobaar-Signature HMAC-SHA256 header of the raw body.
+ * A webhook failure never fails SMS delivery (both are independent).
+ */
+async function sendViaWebhook(args: {
+  notification: { id: string; type: string; recipient: string; body: string; tenantId: string; appointmentId: string | null; createdAt: Date }
+  tenantId: string
+  type: NotificationType
+}): Promise<{ ok: boolean; error?: string }> {
+  const url = process.env.NOTIFICATION_WEBHOOK_URL
+  if (!url) return { ok: true } // webhook optional — no-op success
+  try {
+    const payload = JSON.stringify({
+      event: 'notification.created',
+      type: args.type,
+      channel: 'SMS',
+      tenantId: args.tenantId,
+      notificationId: args.notification.id,
+      appointmentId: args.notification.appointmentId,
+      recipient: args.notification.recipient,
+      body: args.notification.body,
+      createdAt: args.notification.createdAt.toISOString(),
+    })
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    const secret = process.env.NOTIFICATION_WEBHOOK_SECRET
+    if (secret) {
+      const { createHmac } = await import('crypto')
+      headers['X-Nobaar-Signature'] = createHmac('sha256', secret).update(payload).digest('hex')
+    }
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: payload,
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return { ok: false, error: `webhook error ${res.status}` }
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
   }
 }

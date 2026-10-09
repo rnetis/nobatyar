@@ -18,7 +18,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 
 export interface MeResponse {
-  user: { id: string; name: string; role: string; tenantId: string | null; email: string; tenant?: { name: string; slug: string } } | null
+  user: { id: string; name: string; role: string; tenantId: string | null; email: string; impersonating?: boolean; tenant?: { name: string; slug: string } } | null
 }
 
 const NAV = [

@@ -25,6 +25,7 @@ export async function POST(req: Request) {
   }
   if (!name) return NextResponse.json({ error: 'نام مرکز الزامی است' }, { status: 400 })
   const slug = `t-${crypto.randomUUID().slice(0, 8)}`
+  let createdOwnerPassword: string | undefined
   const tenant = await db.tenant.create({
     data: {
       name,
@@ -35,21 +36,25 @@ export async function POST(req: Request) {
     },
   })
   if (ownerEmail) {
+    // Generate a strong one-time initial password; it is returned ONCE in this
+    // response so the platform admin can hand it to the business owner.
+    const initialPassword = crypto.randomUUID().slice(0, 8) + crypto.randomUUID().slice(0, 8) + 'Aa1!'
     const { hashPassword } = await import('@/lib/auth')
     await db.user.create({
       data: {
         tenantId: tenant.id,
         name: ownerName || 'مدیر مرکز',
         email: ownerEmail.toLowerCase(),
-        passwordHash: hashPassword('demo1234'),
+        passwordHash: hashPassword(initialPassword),
         role: 'TENANT_OWNER',
       },
     })
+    createdOwnerPassword = initialPassword
   }
   await db.auditLog.create({
     data: { actor: session.name, role: session.role, action: 'TENANT_CREATE', entityType: 'Tenant', entityId: tenant.id, detail: JSON.stringify({ name, slug }) },
   })
-  return NextResponse.json({ tenant })
+  return NextResponse.json({ tenant, initialPassword: createdOwnerPassword })
 }
 
 export async function PATCH(req: Request) {

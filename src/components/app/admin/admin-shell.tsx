@@ -304,7 +304,7 @@ function TenantsSection() {
   })
 
   const act = useMutation({
-    mutationFn: (body: Record<string, unknown>) => apiPatch('/api/admin/tenants', body),
+    mutationFn: (body: Record<string, unknown>) => apiPatch<{ redirect?: string }>('/api/admin/tenants', body),
     onSuccess: (res: { redirect?: string }) => {
       if (res?.redirect) {
         window.location.hash = res.redirect
@@ -433,14 +433,19 @@ function CreateTenantDialog({ open, plans, onClose }: { open: boolean; plans: { 
   const [planId, setPlanId] = useState<string | null>(null)
   const [ownerName, setOwnerName] = useState('')
   const [ownerEmail, setOwnerEmail] = useState('')
+  const [issuedPassword, setIssuedPassword] = useState<string | null>(null)
 
   const create = useMutation({
-    mutationFn: () => apiPost('/api/admin/tenants', { name, category, planId, ownerName, ownerEmail }),
-    onSuccess: () => {
+    mutationFn: () => apiPost<{ initialPassword?: string }>('/api/admin/tenants', { name, category, planId, ownerName, ownerEmail }),
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ['admin-tenants'] })
       toast({ title: 'مستأجر جدید ایجاد شد' })
-      onClose()
       setName(''); setOwnerName(''); setOwnerEmail('')
+      if (res?.initialPassword) {
+        setIssuedPassword(res.initialPassword)
+      } else {
+        onClose()
+      }
     },
     onError: (e) => toast({ title: e instanceof Error ? e.message : 'خطا', variant: 'destructive' }),
   })
@@ -449,6 +454,19 @@ function CreateTenantDialog({ open, plans, onClose }: { open: boolean; plans: { 
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="sm:max-w-md p-6" dir="rtl">
         <DialogHeader><DialogTitle className="font-black">ایجاد Tenant جدید</DialogTitle></DialogHeader>
+        {issuedPassword ? (
+          <div className="mt-4 space-y-3">
+            <p className="text-sm font-bold">حساب مدیر مرکز ساخته شد.</p>
+            <p className="text-xs text-[#525252]">این رمز عبور اولیه فقط همین یک‌بار نمایش داده می‌شود — آن را برای مدیر مرکز کپی کنید:</p>
+            <div className="border-2 border-[#0a0a0a] bg-[#f5f5f5] px-4 py-3 vb-code text-center text-lg font-black select-all" dir="ltr">
+              {issuedPassword}
+            </div>
+            <Button onClick={() => { setIssuedPassword(null); onClose() }}
+              className="w-full h-11 rounded-none bg-[#0a0a0a] text-[#fafafa] hover:bg-[#ef4444] font-bold">
+              کپی شد — بستن
+            </Button>
+          </div>
+        ) : (
         <div className="space-y-3 mt-2">
           <div>
             <Label className="text-xs font-bold">نام مرکز *</Label>
@@ -480,13 +498,14 @@ function CreateTenantDialog({ open, plans, onClose }: { open: boolean; plans: { 
               <Input value={ownerName} onChange={(e) => setOwnerName(e.target.value)} className="h-10 rounded-none" placeholder="نام مدیر" />
               <Input value={ownerEmail} onChange={(e) => setOwnerEmail(e.target.value)} className="h-10 rounded-none" placeholder="owner@center.ir" dir="ltr" />
             </div>
-            <p className="text-[10px] text-[#525252]">رمز اولیه: demo1234</p>
+            <p className="text-[10px] text-[#525252]">یک رمز عبور اولیهٔ امن به‌صورت خودکار ساخته و یک‌بار در همین دیالوگ نمایش داده می‌شود.</p>
           </div>
           <Button onClick={() => create.mutate()} disabled={create.isPending || !name.trim()}
             className="w-full h-11 rounded-none bg-[#0a0a0a] text-[#fafafa] hover:bg-[#ef4444] font-bold">
             ایجاد مستأجر
           </Button>
         </div>
+        )}
       </DialogContent>
     </Dialog>
   )

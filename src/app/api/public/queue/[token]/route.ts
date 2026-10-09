@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { getLiveState } from '@/lib/queue-engine'
-import { calcEta } from '@/lib/queue-engine'
+import { getLiveState, calcEta } from '@/lib/queue-engine'
+import type { QueueEntry as PrismaQueueEntry } from '@prisma/client'
 
 /**
  * Public Live Queue state by token — no login required (PRD §22, §35, AC-002)
@@ -34,7 +34,7 @@ export async function GET(
     where: { branchId_serviceId_date: { branchId: appt.branchId, serviceId: appt.serviceId, date } },
   })
 
-  let entry = null
+  let entry: PrismaQueueEntry | null = null
   let eta = { peopleAhead: 0, estimatedWait: 0 }
   if (queue) {
     entry = await db.queueEntry.findUnique({ where: { appointmentId: appt.id } })

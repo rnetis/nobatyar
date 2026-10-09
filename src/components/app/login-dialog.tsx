@@ -25,16 +25,15 @@ export function LoginDialog({ scope, children }: { scope: 'business' | 'admin'; 
   const { toast } = useToast()
   const qc = useQueryClient()
 
-  const submit = async (e?: React.FormEvent, demo?: { email: string; password: string }) => {
+  const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()
-    const creds = demo || { email, password }
-    if (!creds.email || !creds.password) {
+    if (!email || !password) {
       toast({ title: 'ایمیل و رمز عبور را وارد کنید', variant: 'destructive' })
       return
     }
     setLoading(true)
     try {
-      const res = await apiPost<LoginResponse>('/api/auth/login', creds)
+      const res = await apiPost<LoginResponse>('/api/auth/login', { email, password })
       toast({ title: `خوش آمدید ${res.user.name}` })
       setOpen(false)
       qc.invalidateQueries() // refresh session-dependent queries (e.g. 'me')
@@ -79,31 +78,6 @@ export function LoginDialog({ scope, children }: { scope: 'business' | 'admin'; 
             <LogIn className="w-4 h-4" />
             {loading ? 'در حال ورود…' : 'ورود'}
           </Button>
-          <div className="border-t-2 border-dashed border-[#e5e5e5] pt-3 space-y-2">
-            <p className="text-xs font-bold text-[#525252]">حساب‌های نمایشی (کلیک کنید):</p>
-            <div className="grid grid-cols-1 gap-2">
-              {scope === 'business' ? (
-                <>
-                  <button type="button" onClick={() => submit(undefined, { email: 'owner@mehr.ir', password: 'demo1234' })}
-                    className="vb-btn vb-btn-secondary vb-btn-sm justify-between w-full">
-                    <span>مدیر کلینیک سلامت مهر</span>
-                    <span className="vb-code text-[10px]">owner@mehr.ir</span>
-                  </button>
-                  <button type="button" onClick={() => submit(undefined, { email: 'operator@mehr.ir', password: 'demo1234' })}
-                    className="vb-btn vb-btn-secondary vb-btn-sm justify-between w-full">
-                    <span>اپراتور صف کلینیک</span>
-                    <span className="vb-code text-[10px]">operator@mehr.ir</span>
-                  </button>
-                </>
-              ) : (
-                <button type="button" onClick={() => submit(undefined, { email: 'admin@nobaas.ir', password: 'admin1234' })}
-                  className="vb-btn vb-btn-secondary vb-btn-sm justify-between w-full">
-                  <span>مدیر کل پلتفرم</span>
-                  <span className="vb-code text-[10px]">admin@nobaas.ir</span>
-                </button>
-              )}
-            </div>
-          </div>
         </form>
       </DialogContent>
     </Dialog>
