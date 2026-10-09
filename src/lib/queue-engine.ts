@@ -518,11 +518,18 @@ export async function executeQueueAction(args: {
   })
   const rooms = [`t:${tenant.id}`, ...participants.map((f) => `q:${f.appointment.liveToken}`)]
   const fresh = participants.filter((f) => f.status === 'WAITING')
-  const servingCode = (await db.queue.findUnique({ where: { id: queue.id } }))?.currentServing
+  const currentQueue = await db.queue.findUnique({ where: { id: queue.id } })
+  const servingCode = currentQueue?.currentServing
+
+  let staffN = 1
+  let perPerson = 15
+  if (fresh.length > 0) {
+    staffN = await activeStaffCount(queue.branchId, queue.serviceId)
+    perPerson = Math.max(5, Math.round((currentQueue?.avgServiceMin || 15) / staffN))
+  }
+
   for (const f of fresh) {
     const peopleAhead = fresh.filter((x) => x.position < f.position).length
-    const staffN = await activeStaffCount(queue.branchId, queue.serviceId)
-    const perPerson = Math.max(5, Math.round((await db.queue.findUnique({ where: { id: queue.id } }))?.avgServiceMin || 15) / staffN)
     await broadcastQueueUpdate(tenant.id, f.appointment.liveToken, {
       queueId: queue.id,
       event: 'queue.updated',
