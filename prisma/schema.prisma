@@ -39,11 +39,17 @@ model Tenant {
   locale        String   @default("fa")
   planId        String?
   plan          Plan?    @relation(fields: [planId], references: [id])
-  smsProvider   String   @default("کاوه‌نگار")
+  smsProvider   String   @default("کاوه‌نگار") // 휴먼 readable label used in UI
+  // Per-tenant SMS provider config (JSON: {provider, config:{apiKey,lineNumber,from}}).
+  // When empty, platform env defaults are used.
+  smsConfig     String   @default("{}")
   // notification policy JSON: {smsOnQueueChange,smsOnReschedule,smsOnCancel,smsBeforeTurn,minorThreshold}
   notifPolicy   String   @default("{}")
   // cancellation policy JSON: {allowCustomerCancel, minMinutesBefore, sendCancelSms}
   cancelPolicy  String   @default("{}")
+  // Per-tenant Jinja2-style SMS templates keyed by NotificationType.
+  // {BOOKING_CREATED: "...{{ customer_name }}...{{ live_queue_url }}", ...}
+  notificationTemplates String @default("{}")
   queuePrefix   String   @default("A")
   reasonRequired Boolean @default(false)
   createdAt     DateTime @default(now())
@@ -71,7 +77,9 @@ model User {
   passwordHash String
   // SUPER_ADMIN | SUPPORT | TENANT_OWNER | TENANT_ADMIN | MANAGER | OPERATOR | STAFF
   role         String   @default("STAFF")
+  // ACTIVE | PENDING | DISABLED -- PENDING = registration awaiting admin approval
   status       String   @default("ACTIVE")
+  plannedBusinessName String?
   createdAt    DateTime @default(now())
 }
 
@@ -214,12 +222,13 @@ model QueueEntry {
 
 model Notification {
   id                String    @id @default(cuid())
-  tenantId          String
-  tenant            Tenant    @relation(fields: [tenantId], references: [id])
+  // null = platform-level broadcast (sent by super admin, not tied to a tenant)
+  tenantId          String?
+  tenant            Tenant?   @relation(fields: [tenantId], references: [id])
   appointmentId     String?
   appointment       Appointment? @relation(fields: [appointmentId], references: [id])
   channel           String    @default("SMS")
-  // BOOKING_CREATED | QUEUE_CHANGED | RESCHEDULED | CANCELLED | YOUR_TURN | CALLED | NO_SHOW
+  // BOOKING_CREATED | QUEUE_CHANGED | RESCHEDULED | CANCELLED | YOUR_TURN | CALLED | NO_SHOW | INVITE | PLATFORM_BROADCAST
   type              String
   recipient         String
   body              String
@@ -228,6 +237,8 @@ model Notification {
   providerMessageId String?
   createdAt         DateTime  @default(now())
   sentAt            DateTime?
+  // platform-panel soft-read marker (null = unread)
+  readAt            DateTime?
 }
 
 // ─────────────────────────── Support & Audit ───────────────────────────
@@ -258,5 +269,9 @@ model AuditLog {
   entityType String
   entityId   String?
   detail     String?
+  // soft-hide (rows are never hard-deleted, audit trail is append-only)
+  deleted    Boolean  @default(false)
+  deletedAt  DateTime?
+  deletedBy  String?
   createdAt  DateTime @default(now())
 }

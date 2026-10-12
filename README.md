@@ -13,7 +13,7 @@ Persian (RTL) multi-tenant SaaS platform for appointment booking, live queue man
 | Super Admin | `/#/admin` | `admin@nobaas.ir` | `bGlTpdcV36FMshh5Aa1!` |
 
 - Business/tenant accounts are created through the Super Admin panel → **Tenants → ایجاد Tenant**. A strong one-time initial password is generated automatically and shown **once** to the platform admin.
-- To rotate the admin password, change `ADMIN_PASSWORD` in `.env` and re-run the seed (`bun scripts/seed.ts`), or update the hash directly in the database.
+- To rotate the admin password, change `ADMIN_PASSWORD` in `.env` and re-run the seed (`pnpm seed`), or update the hash directly in the database.
 
 ---
 
@@ -23,9 +23,11 @@ Persian (RTL) multi-tenant SaaS platform for appointment booking, live queue man
 pnpm install
 pnpm db:generate
 pnpm db:push
-bun scripts/seed.ts        # production seed: plans + super admin only
+pnpm seed                  # production seed: plans + super admin only
 pnpm dev                   # http://localhost:3000
 ```
+
+> Runs on **Node.js ≥ 22** (verified on Node 24). Bun is not required.
 
 ### Scripts
 
@@ -35,7 +37,7 @@ pnpm dev                   # http://localhost:3000
 | `pnpm build` / `pnpm start` | Production build (standalone) & start |
 | `pnpm lint` | ESLint |
 | `pnpm db:push` / `db:generate` / `db:migrate` / `db:reset` | Prisma database tasks |
-| `bun scripts/seed.ts` | **Production** seed (plans + super admin; no demo data) |
+| `pnpm seed` | **Production** seed (plans + super admin; no demo data) |
 
 ### Mini service (live queue WebSocket)
 
@@ -43,7 +45,7 @@ The queue engine broadcasts real-time updates through a small socket.io service:
 
 ```bash
 cd mini-services/queue-service
-bun install && bun run index.ts   # WS :3003, broadcast API :3004
+npm install && node index.ts   # WS :3003, broadcast API :3004
 ```
 
 ---
@@ -58,8 +60,11 @@ bun install && bun run index.ts   # WS :3003, broadcast API :3004
 | `ADMIN_PASSWORD` | ✅ (seed) | Platform super admin password (min 10 chars) |
 | `NEXT_PUBLIC_BASE_URL` | recommended | Public origin used in SMS live-queue links |
 | `QUEUE_SERVICE_URL` | optional | Broadcast API of the queue mini-service (default `http://localhost:3004`) |
-| `SMSIR_API_KEY` | for SMS | sms.ir API key (X-API-KEY) |
+| `SMSIR_API_KEY` | for SMS | sms.ir API key (`X-API-KEY`). Leave empty to keep messages in the outbox. |
 | `SMSIR_LINE_NUMBER` | for SMS | sms.ir sender line number (numeric) |
+| `HTTPSMS_API_KEY` | for SMS | httpsms.com API key (`x-api-Key` header) |
+| `HTTPSMS_FROM_NUMBER` | for SMS | httpsms.com sender number (e.g. `+989999783444`) |
+| `SMSIR_API_URL` / `HTTPSMS_API_URL` | optional | Override provider base URLs (point at a mock/staging provider) |
 | `NOTIFICATION_WEBHOOK_URL` | optional | Webhook endpoint that receives every notification as JSON |
 | `NOTIFICATION_WEBHOOK_SECRET` | optional | If set, webhook requests carry `X-Nobaar-Signature` (HMAC-SHA256 hex of the raw body) |
 
@@ -90,7 +95,38 @@ Per sms.ir docs, a successful response has `status: 1` and returns a message id 
 
 Notification events (gated per tenant by `notifPolicy`): `BOOKING_CREATED`, `QUEUE_CHANGED`, `RESCHEDULED`, `CANCELLED`, `YOUR_TURN`, `CALLED`, `NO_SHOW`.
 
-### 2. Webhook (optional)
+### 2. SMS via httpsms.com
+
+Alternative provider (per-tenant or platform-wide). Set `HTTPSMS_API_KEY` + `HTTPSMS_FROM_NUMBER` for a platform-wide default, or let each tenant store its own credentials in the admin panel (*پیامک‌های پلتفرم → تنظیمات پیامک*). Each notification is sent as:
+
+```http
+POST https://api.httpsms.com/v1/messages/send
+Content-Type: application/json
+x-api-Key: <api key>
+
+{
+  "from": "+989999783444",
+  "to": "09123456789",
+  "content": "نوبت شما ثبت شد…"
+}
+```
+
+Precedence: **tenant `smsConfig` → platform env vars → disabled**. When nothing is configured the message stays `PENDING` in the outbox (never lost, never silently dropped).
+
+### 3. Per-tenant templates (Jinja2-style)
+
+Each tenant can override the text of any notification type from the admin panel. Templates use `{{ variable }}` placeholders rendered server-side in `renderMessageBody()`:
+
+```text
+سلام {{ customer_name }}! نوبت شما در {{ business_name }} ثبت شد.
+صف زنده: {{ live_queue_url }}
+```
+
+Available variables: `customer_name`, `business_name`, `branch_name`, `service_name`, `appointment_number`, `appointment_date`, `appointment_time`, `queue_position`, `people_ahead`, `estimated_wait`, `live_queue_url`. Unknown variables render as empty strings; empty/missing templates fall back to the built-in defaults.
+
+> Provider credentials in `smsConfig` are stored as plain JSON in SQLite — encrypt them at rest if the database is not otherwise protected.
+
+### 4. Webhook (optional)
 
 Set `NOTIFICATION_WEBHOOK_URL` to receive every notification as a JSON `POST`:
 

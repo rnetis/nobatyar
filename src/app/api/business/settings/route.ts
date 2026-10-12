@@ -11,6 +11,15 @@ export async function GET() {
     include: { plan: true },
   })
   if (!tenant) return NextResponse.json({ error: 'یافت نشد' }, { status: 404 })
+  let smsConfig: { provider: string; config?: Record<string, string> } | null = null
+  try {
+    const parsed = JSON.parse(tenant.smsConfig || '{}') as { provider?: string; config?: Record<string, string> }
+    if (parsed && typeof parsed === 'object' && parsed.provider) {
+      smsConfig = { provider: parsed.provider, config: parsed.config }
+    }
+  } catch { /* noop */ }
+  let notificationTemplates: Record<string, string> = {}
+  try { notificationTemplates = JSON.parse(tenant.notificationTemplates || '{}') as Record<string, string> } catch { /* noop */ }
   return NextResponse.json({
     tenant: {
       id: tenant.id, name: tenant.name, slug: tenant.slug, category: tenant.category,
@@ -20,6 +29,8 @@ export async function GET() {
     },
     notifPolicy: JSON.parse(tenant.notifPolicy || '{}'),
     cancelPolicy: JSON.parse(tenant.cancelPolicy || '{}'),
+    smsConfig: smsConfig || null,
+    notificationTemplates: Object.keys(notificationTemplates).length ? notificationTemplates : null,
   })
 }
 

@@ -35,6 +35,7 @@ export const NOTIFICATION_TYPE_FA: Record<string, string> = {
   YOUR_TURN: 'نوبت نزدیک است',
   CALLED: 'فراخوانی',
   NO_SHOW: 'عدم حضور',
+  PLATFORM_BROADCAST: 'پیامک پلتفرم',
 }
 
 export const AUDIT_ACTION_FA: Record<string, string> = {
@@ -61,9 +62,25 @@ export const AUDIT_ACTION_FA: Record<string, string> = {
   TENANT_SUSPEND: 'تعلیق مستأجر',
   TENANT_ACTIVATE: 'فعال‌سازی مستأجر',
   TENANT_IMPERSONATE: 'ورود به پنل مستأجر',
+  TENANT_UPDATE: 'ویرایش مستأجر',
+  TENANT_DELETE: 'حذف مستأجر',
+  TENANT_UNDELETE: 'بازسازی مستأجر',
+  PLAN_CREATE: 'ایجاد پلن',
+  PLAN_DELETE: 'حذف پلن',
   PLAN_CHANGE: 'تغییر پلن',
   PLAN_UPDATE: 'ویرایش پلن',
+  TICKET_CREATE: 'ایجاد تیکت',
   TICKET_UPDATE: 'بروزرسانی تیکت',
+  PLATFORM_SMS_SEND: 'ارسال پیامک پلتفرم',
+  PLATFORM_NOTIFICATION_ACK: 'خوانده شد',
+  PLATFORM_NOTIFICATION_CLEAR: 'پاک کردن وضعیت خوانده',
+  USER_APPROVE: 'تأیید ثبت‌نام',
+  USER_REJECT: 'رد ثبت‌نام',
+  USER_REACTIVATE: 'فعال‌سازی مجدد کاربر',
+  BRANCH_CREATE: 'ایجاد شعبه',
+  BRANCH_UPDATE: 'ویرایش شعبه',
+  BRANCH_DELETE: 'حذف شعبه',
+  NOTIFICATION_ACK: 'خواندن پیامک',
 }
 
 export const TICKET_STATUS_FA: Record<string, string> = {

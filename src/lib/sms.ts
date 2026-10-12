@@ -12,7 +12,59 @@ import { formatJalaliFull, formatTime, faDigits, minutesFa } from '@/lib/jalali'
  * business panel SMS log) instead of being marked sent.
  */
 
-const SMSIR_API_URL = 'https://api.sms.ir/v1/send/bulk'
+// Base URLs are overridable for local/staging testing (point them at a mock provider).
+const SMSIR_API_URL = process.env.SMSIR_API_URL || 'https://api.sms.ir/v1/send/bulk'
+const HTTPSMS_API_URL = process.env.HTTPSMS_API_URL || 'https://api.httpsms.com/v1/messages/send'
+
+/**
+ * SMS provider abstraction. Each tenant (or the platform) can choose a provider
+ * and store its credentials on theTenant.smsConfig (JSON) or via platform env.
+ *
+ * Supported providers:
+ *  - sms.ir     → X-API-KEY + lineNumber (sms.ir bulk API)
+ *  - httpsms    → x-api-key header + from/to/content JSON body (httpsms.com)
+ *  - disabled   → no provider configured; messages stay PENDING in the outbox
+ */
+export type SmsProviderId = 'sms.ir' | 'httpsms' | 'disabled'
+
+export interface SmsProviderConfig {
+  provider: SmsProviderId
+  /** Provider-specific config shape. Stored as JSON on Tenant.smsConfig. */
+  config: Record<string, unknown>
+}
+
+export interface SmsSendResult {
+  ok: boolean
+  configured: boolean
+  messageId?: string
+  error?: string
+}
+
+function isConfigured(cfg: SmsProviderConfig): boolean {
+  if (cfg.provider === 'sms.ir') {
+    return Boolean(cfg.config?.apiKey && cfg.config?.lineNumber)
+  }
+  if (cfg.provider === 'httpsms') {
+    return Boolean(cfg.config?.apiKey && cfg.config?.from)
+  }
+  return false
+}
+
+export async function sendSms(
+  args: { recipient: string; messageText: string; provider: SmsProviderConfig },
+): Promise<SmsSendResult> {
+  if (!isConfigured(args.provider)) {
+    return { ok: false, configured: false, error: 'SMS provider not configured — kept in outbox' }
+  }
+
+  if (args.provider.provider === 'sms.ir') {
+    return sendViaSmsIr({ recipient: args.recipient, messageText: args.messageText, config: args.provider.config })
+  }
+  if (args.provider.provider === 'httpsms') {
+    return sendViaHttpSms({ recipient: args.recipient, messageText: args.messageText, config: args.provider.config })
+  }
+  return { ok: false, configured: false, error: 'Unknown SMS provider' }
+}
 
 export type NotificationType =
   | 'BOOKING_CREATED'
@@ -22,6 +74,7 @@ export type NotificationType =
   | 'YOUR_TURN'
   | 'CALLED'
   | 'NO_SHOW'
+  | 'INVITE'
 
 export interface TemplateVars {
   customer_name?: string
@@ -61,6 +114,8 @@ function defaultBody(type: NotificationType, v: TemplateVars): string {
       return `نوبت شما فراخوانده شد. لطفاً برای دریافت خدمت مراجعه کنید.\nشماره نوبت: ${v.appointment_number}`
     case 'NO_SHOW':
       return `به دلیل عدم حضور، نوبت شما (${v.appointment_number}) به عنوان No-show ثبت شد.\n${v.business_name}`
+    case 'INVITE':
+      return `${v.customer_name} عزیز، به ${v.business_name} خوش آمدید. برای رزرو نوبت جدید اقدام کنید: ${link}`
   }
 }
 
@@ -97,8 +152,15 @@ export function buildTemplateVars(args: {
 }
 
 /**
- * Persist an outbox notification (simulated SMS provider).
+ * Persist an outbox notification and deliver it via the tenant's chosen SMS
+ * provider (or the platform default if the tenant has none configured).
  * `material` = real change worth an SMS (PRD §21 anti-spam policy).
+ *
+ * Template rendering:
+ *  - When the tenant has a custom template for this notification type it is
+ *    used ( Jinja2-style {{ var }} substitution via renderTemplate).
+ *  - When no custom template exists, defaultBody is used.
+ *  - bodyOverride always wins (used by manual resends / admin broadcasts).
  */
 export async function queueNotification(args: {
   tenantId: string
@@ -124,13 +186,18 @@ export async function queueNotification(args: {
       YOUR_TURN: 'smsBeforeTurn',
       CALLED: 'smsOnCalled',
       NO_SHOW: 'smsOnNoShow',
+      INVITE: '', // marketing invite: not gated by per-event policy flags
     }
     const flag = eventFlag[args.type]
     if (flag && policy[flag] === false) return
     // Minor queue updates (≤ threshold positions) → WebSocket only
     if (args.type === 'QUEUE_CHANGED' && args.material === false) return
 
-    const body = args.bodyOverride || defaultBody(args.type, args.vars)
+    const body = args.bodyOverride || renderMessageBody({
+      tenant,
+      type: args.type,
+      vars: args.vars,
+    })
     const created = await db.notification.create({
       data: {
         tenantId: args.tenantId,
@@ -143,9 +210,12 @@ export async function queueNotification(args: {
       },
     })
 
-    // Deliver via sms.ir + optional webhook (outbox worker flush)
+    // Resolve the SMS provider: tenant config first, then platform env, else disabled
+    const provider = resolveSmsProvider(tenant)
+
+    // Deliver via chosen provider + optional webhook (outbox worker flush)
     const [smsResult] = await Promise.allSettled([
-      sendViaSmsIr({ recipient: args.recipient, messageText: body }),
+      sendSms({ recipient: args.recipient, messageText: body, provider }),
       sendViaWebhook({ notification: created, tenantId: args.tenantId, type: args.type }),
     ])
 
@@ -169,6 +239,58 @@ export async function queueNotification(args: {
   }
 }
 
+/**
+ * Resolve which SMS provider to use for a tenant.
+ *  - tenant.smsConfig.configured == true → use that
+ *  - else if platform env (SMSIR_API_KEY / HTTPSMS) is set → use the first configured one
+ *  - else → disabled (messages stay PENDING)
+ */
+export function resolveSmsProvider(tenant: {
+  smsConfig?: string | null
+  smsProvider?: string | null
+}): SmsProviderConfig {
+  let tenantCfg: SmsProviderConfig | null = null
+  try {
+    if (tenant.smsConfig) {
+      const parsed = JSON.parse(tenant.smsConfig) as SmsProviderConfig
+      if (parsed && parsed.provider && isConfigured(parsed)) {
+        tenantCfg = parsed
+      }
+    }
+  } catch { /* noop */ }
+
+  if (tenantCfg) return tenantCfg
+
+  // platform-level fallback: prefer sms.ir if configured, then httpsms
+  const smsIrKey = process.env.SMSIR_API_KEY
+  const smsIrLine = process.env.SMSIR_LINE_NUMBER
+  if (smsIrKey && smsIrLine) {
+    return { provider: 'sms.ir', config: { apiKey: smsIrKey, lineNumber: smsIrLine } }
+  }
+  const httpsmsKey = process.env.HTTPSMS_API_KEY
+  const httpsmsFrom = process.env.HTTPSMS_FROM_NUMBER
+  if (httpsmsKey && httpsmsFrom) {
+    return { provider: 'httpsms', config: { apiKey: httpsmsKey, from: httpsmsFrom } }
+  }
+
+  return { provider: 'disabled', config: {} }
+}
+
+/** Render the SMS body for a notification: custom template (if any) else default. */
+export function renderMessageBody(args: {
+  tenant: { notificationTemplates?: string | null }
+  type: NotificationType
+  vars: TemplateVars
+}): string {
+  let templates: Record<string, string> = {}
+  try { templates = JSON.parse(args.tenant.notificationTemplates || '{}') as Record<string, string> } catch { /* noop */ }
+  const tpl = (templates[args.type] || '').trim()
+  if (tpl) {
+    return renderTemplate(tpl, args.vars)
+  }
+  return defaultBody(args.type, args.vars)
+}
+
 interface SmsIrResult {
   ok: boolean
   configured: boolean
@@ -178,16 +300,18 @@ interface SmsIrResult {
 
 /**
  * Send an SMS via the sms.ir bulk API.
- * Requires SMSIR_API_KEY and SMSIR_LINE_NUMBER env vars; when either is
- * missing the message is left in the outbox (PENDING) and nothing is sent.
+ * When tenant-level config is present it takes precedence over env vars (so each
+ * tenant can use its own sms.ir account). Fallback to env vars keeps existing
+ * platform-wide setups working.
  * Docs: https://documenter.getpostman.com/view/5019639/2sA35D6aM2 (sms.ir v1)
  */
-async function sendViaSmsIr(args: {
+export async function sendViaSmsIr(args: {
   recipient: string
   messageText: string
-}): Promise<SmsIrResult> {
-  const apiKey = process.env.SMSIR_API_KEY
-  const lineNumber = process.env.SMSIR_LINE_NUMBER
+  config?: Record<string, unknown>
+}): Promise<SmsSendResult> {
+  const apiKey = String(args.config?.apiKey || process.env.SMSIR_API_KEY || '')
+  const lineNumber = String(args.config?.lineNumber || process.env.SMSIR_LINE_NUMBER || '')
   if (!apiKey || !lineNumber) {
     return { ok: false, configured: false, error: 'SMSIR_API_KEY / SMSIR_LINE_NUMBER not configured — kept in outbox' }
   }
@@ -217,15 +341,62 @@ async function sendViaSmsIr(args: {
 }
 
 /**
+ * Send an SMS via httpsms.com.
+ * Requires: x-api-key header (apiKey) + `from` (sender number, e.g. +989999783444)
+ * Body: { from, to, content }.
+ * Docs: https://httpsms.com/docs (used as the second configurable provider).
+ */
+export async function sendViaHttpSms(args: {
+  recipient: string
+  messageText: string
+  config: Record<string, unknown>
+}): Promise<SmsSendResult> {
+  const apiKey = String(args.config?.apiKey || '')
+  const from = String(args.config?.from || '')
+  if (!apiKey || !from) {
+    return { ok: false, configured: false, error: 'HTTPSMS_API_KEY / from not configured — kept in outbox' }
+  }
+  try {
+    const res = await fetch(HTTPSMS_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-Key': apiKey,
+      },
+      body: JSON.stringify({
+        from,
+        to: args.recipient,
+        content: args.messageText,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    const json = (await res.json().catch(() => null)) as { status?: number; data?: { id?: string; messageId?: string }; message?: string } | null
+    if (!res.ok || !json) {
+      return { ok: false, configured: true, error: `httpsms error ${res.status}: ${JSON.stringify(json)}` }
+    }
+    // httpsms returns 200 on success; treat any non-ok HTTP as failure.
+    const ok = res.ok
+    return {
+      ok,
+      configured: true,
+      messageId: String(json.data?.id ?? json.data?.messageId ?? crypto.randomUUID()),
+      error: ok ? undefined : String(json.message || `httpsms error ${res.status}`),
+    }
+  } catch (e) {
+    return { ok: false, configured: true, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/**
  * Optional generic webhook: POSTs the notification payload as JSON to
  * NOTIFICATION_WEBHOOK_URL. When NOTIFICATION_WEBHOOK_SECRET is set, the
  * request carries an X-Nobaar-Signature HMAC-SHA256 header of the raw body.
  * A webhook failure never fails SMS delivery (both are independent).
  */
-async function sendViaWebhook(args: {
-  notification: { id: string; type: string; recipient: string; body: string; tenantId: string; appointmentId: string | null; createdAt: Date }
+export async function sendViaWebhook(args: {
+  notification: { id: string; type: string; recipient: string; body: string; tenantId: string | null; appointmentId: string | null; createdAt: Date }
   tenantId: string
-  type: NotificationType
+  type: NotificationType | (string & {})
 }): Promise<{ ok: boolean; error?: string }> {
   const url = process.env.NOTIFICATION_WEBHOOK_URL
   if (!url) return { ok: true } // webhook optional — no-op success

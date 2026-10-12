@@ -39,7 +39,11 @@ export async function GET() {
   const latestTenants = await db.tenant.findMany({
     orderBy: { createdAt: 'desc' },
     take: 5,
-    include: { plan: { select: { name: true } }, _count: { select: { appointments: true } } },
+    select: {
+      id: true, name: true, category: true, status: true,
+      plan: { select: { name: true } },
+      _count: { select: { appointments: true } },
+    },
   })
 
   const notifByType = await db.notification.groupBy({
@@ -52,7 +56,10 @@ export async function GET() {
     kpis: { tenants, activeTenants, users, bookingsMonth, queuesOpen, smsSent, ticketsOpen, mrr },
     plans: plans.map((p) => ({ id: p.id, name: p.name, slug: p.slug, priceMonthly: p.priceMonthly, tenants: p._count.tenants })),
     trend: statusByDay,
-    latestTenants,
+    latestTenants: latestTenants.map((t) => ({
+      id: t.id, name: t.name, category: t.category, status: t.status,
+      plan: t.plan, _count: t._count,
+    })),
     notifByType: notifByType.map((n) => ({ type: n.type, count: n._count.type })),
   })
 }

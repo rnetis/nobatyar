@@ -10,10 +10,11 @@ import { faDigits, faNumber, formatJalaliFull, minutesFa } from '@/lib/jalali'
 import { QueueSection } from './queue-board'
 import { AppointmentsSection } from './appointments'
 import { ServicesSection, StaffSection } from './services'
+import { CustomersSection } from './customers'
 import { SettingsSection, SmsSection, AuditSection } from './settings'
 import {
   LayoutDashboard, ListOrdered, CalendarClock, Briefcase, UsersRound,
-  Settings, MessageSquareText, History, LogOut, Radio, TrendingUp,
+  Settings, MessageSquareText, History, LogOut, Radio, TrendingUp, UserRoundSearch,
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 
@@ -27,6 +28,7 @@ const NAV = [
   { key: 'appointments', label: 'نوبت‌ها', icon: CalendarClock },
   { key: 'services', label: 'خدمات', icon: Briefcase },
   { key: 'staff', label: 'کارکنان', icon: UsersRound },
+  { key: 'customers', label: 'مشتریان', icon: UserRoundSearch },
   { key: 'sms', label: 'گزارش پیامک', icon: MessageSquareText },
   { key: 'audit', label: 'رخدادها (Audit)', icon: History },
   { key: 'settings', label: 'تنظیمات', icon: Settings },
@@ -167,6 +169,7 @@ export function PanelShell({ section }: { section?: string }) {
           {active === 'appointments' && <AppointmentsSection />}
           {active === 'services' && <ServicesSection />}
           {active === 'staff' && <StaffSection />}
+          {active === 'customers' && <CustomersSection />}
           {active === 'sms' && <SmsSection />}
           {active === 'audit' && <AuditSection />}
           {active === 'settings' && <SettingsSection />}

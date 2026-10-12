@@ -18,7 +18,24 @@ Work Log:
 - Verified with agent-browser through Caddy gateway (user path): landing, full booking flow (service→branch→staff→Jalali date→slot→info→confirm→success), live queue page, business login + dashboard + queue board + appointments, admin login + overview + tenants + tickets + audit, mobile 390px viewport
 - Measured AC-003: queue action → LiveQueue UI update in 181ms (target < 2000ms) ✅
 - Verified AC-001 (booking + code + token + SMS outbox), AC-002 (live state), AC-006/AC-007 semantics, idempotency duplicate protection, priority queue recalculation (VIP jumps), manual move, skip
-- Final state: reseeded pristine demo data, lint clean, all health checks green
+- Added SMS provider abstraction: sms.ir + httpsms.com, per-tenant smsConfig + notificationTemplates, Jinja2-style {{ var }} templates, platform provider config/test, admin UI for tenant SMS config + platform SMS compose (fixed admin-shell parse error: missing newline between invalidateQueries and toast)
+- Final state: SMS provider + template work complete
+
+---
+Task ID: 2
+Agent: (continuation)
+Task: Fix parse/type errors, make the project run on Node.js without Bun, verify the SMS provider + template feature end-to-end
+
+Work Log:
+- Fixed parse errors that broke the Turbopack build: missing statement separator in admin-shell (`invalidateQueries(...)` immediately followed by `toast(...)`), stray extra closing brace in api/admin/overview/route.ts, mismatched bracket in panel/customers.tsx (`[inviteOpen, setInviteOpen)`)
+- customers.tsx was dead code (never imported) with an invite button that opened nothing: wired `CustomersSection` into the business panel nav + implemented the invite dialog (custom message + quota-aware SMS invite)
+- Fixed all remaining TypeScript errors surfaced by `tsc --noEmit` (was exit 2): NonNullable session type in sendPlatformSms, invalid `select`+`include` mix in admin overview, `unknown` config narrowing in sanitizeSmsConfig + admin-shell state typing (new TenantSmsConfigState), business settings smsConfig type, `{{ variable }}` JSX text needing a string literal, union narrowing in the PlatformSms send mutation
+- Found and fixed a real routing bug: `/api/admin/notifications/sms-config` returned 404 because it was implemented as a dead sub-path inside the parent route; moved to a proper route file (`sms-config/route.ts`) and removed the dead branch
+- Node.js migration (no Bun required): `start` script now `node .next/standalone/server.js`; seed script now `node --env-file-if-exists=.env scripts/seed.ts` (Node does not auto-load .env like Bun); queue-service dev script now `node --watch index.ts`; removed unused `bun-types` devDependency; README commands converted from bun to pnpm/node. Verified: no `Bun.*` API used anywhere in src/mini-services/scripts
+- Found and fixed a Prisma + pnpm client-shadowing bug: TypeScript and Node resolved a stale generated client in `node_modules/.pnpm/@prisma+client/.../node_modules/.prisma/client` (Oct 9) which lacked smsConfig/notificationTemplates (and older fields like readAt/plannedBusinessName) while the fresh client sat at `node_modules/.prisma/client`. Prisma generate + removal of the stale copy fixed both types and runtime; added `prisma generate` to the build script so the schema can never drift again
+- Added env-overridable provider base URLs (`SMSIR_API_URL` / `HTTPSMS_API_URL`) and made admin test-send use the selected tenant's own provider, so a provider can be tested without sending real SMS
+- Verified end-to-end on the Node standalone server (port 3600): login as SUPER_ADMIN, GET sms-config (200), create tenant, persist httpsms smsConfig + BOOKING_CREATED template, read back, test-send through the tenant's config against a local mock provider, then purge the tenant. Mock captured exactly `POST /v1/messages/send` + `x-api-key` header + `{from,to,content}` body — matching httpsms docs
+- Checks: `npx tsc --noEmit` exit 0, `next build` (Turbopack) exit 0, `pnpm build` exit 0, seed verified on Node against a throwaway DB copy. Test tenant purged; DB left with tenants=0, notifications=0 (2 audit rows for the E2E actions remain by design — the audit trail is append-only)
 
 Stage Summary:
 - Deliverable: runnable multi-tenant SaaS at / (preview via Caddy :81 → port 3000)

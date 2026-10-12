@@ -72,7 +72,7 @@ export async function clearSessionCookie(): Promise<void> {
 export async function requireBusinessSession(): Promise<SessionPayload | null> {
   const s = await getSession()
   if (!s) return null
-  if (!s.tenantId) return null
+  if (!s.tenantId && !s.impersonating) return null
   if (!['TENANT_OWNER', 'TENANT_ADMIN', 'MANAGER', 'OPERATOR', 'STAFF'].includes(s.role)) return null
   return s
 }
@@ -82,5 +82,11 @@ export async function requireAdminSession(): Promise<SessionPayload | null> {
   const s = await getSession()
   if (!s) return null
   if (!['SUPER_ADMIN', 'SUPPORT'].includes(s.role)) return null
+  return s
+}
+
+export async function requireSuperAdminSession(): Promise<SessionPayload | null> {
+  const s = await getSession()
+  if (!s || s.role !== 'SUPER_ADMIN') return null
   return s
 }

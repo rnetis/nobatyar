@@ -20,6 +20,8 @@ interface SettingsResponse {
   }
   notifPolicy: Record<string, boolean>
   cancelPolicy: { allowCustomerCancel?: boolean; minMinutesBefore?: number; sendCancelSms?: boolean }
+  smsConfig?: { provider: string; config?: Record<string, string> } | null
+  notificationTemplates?: Record<string, string> | null
 }
 
 const NOTIF_OPTIONS: { key: string; label: string; desc: string }[] = [
@@ -36,6 +38,7 @@ export function SettingsSection() {
     queryKey: ['biz-settings'],
     queryFn: () => apiGet('/api/business/settings'),
   })
+  const resolvedProvider = data?.smsConfig?.provider || 'disabled'
   if (isLoading || !data) return <SectionSkeleton />
 
   return (
@@ -53,8 +56,7 @@ export function SettingsSection() {
           <Info label="شناسه (Slug)" value={data.tenant.slug} mono />
           <Info label="دسته‌بندی" value={data.tenant.category} />
           <Info label="پیشوند شماره نوبت" value={data.tenant.queuePrefix} mono />
-          <Info label="تلفن" value={data.tenant.phone || '—'} />
-          <Info label="ارائه‌دهنده پیامک" value={data.tenant.smsProvider} />
+          <Info label="تلفن" value={data.tenant.phone || '—'} />            <Info label="ارائه‌دهنده پیامک" value={resolvedProvider === 'sms.ir' ? 'sms.ir' : resolvedProvider === 'httpsms' ? 'httpsms.com' : 'تنظیم‌نشده (پلتفرم)'} />
           <Info label="آدرس" value={data.tenant.address || '—'} wide />
         </div>
       </div>
