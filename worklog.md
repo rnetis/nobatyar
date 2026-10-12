@@ -42,3 +42,21 @@ Stage Summary:
 - Demo logins: owner@mehr.ir / demo1234 (business), admin@nobaas.ir / admin1234 (super admin)
 - Key architecture: Next.js 16 SPA + route handlers (SQLite/Prisma) + socket.io mini-service (3003/3004) wired through Caddy XTransformPort gateway
 - A-107 token for live-queue demo: c10b53d3be6c4efd8851972a6fa75599 (matches landing demo card)
+
+---
+Task ID: 3
+Agent: (continuation)
+Task: Fix the deploy failure (prisma: not found → no .next/standalone/server.js → start crash) and push the SMS provider + admin work
+
+Work Log:
+- Reproduced the host's exact first line: with `node_modules/.bin` off PATH, `sh -c 'prisma generate'` gives `sh: 1: prisma: not found` (exit 127). The build chain was `prisma generate && next build && cp ...`, so `&&` aborted before `next build` ever ran and no `.next/standalone/server.js` was produced — which is why the host's `npm start` died with `Cannot find module '/app/.next/standalone/server.js'`
+- Replaced that chain with `scripts/build.mjs`: resolves the prisma and next CLIs through Node's module resolver instead of $PATH, asserts `.next/standalone/server.js` exists (naming the missing `output: "standalone"` when it does), then copies `.next/static` and `public/`. Verified under a PATH without `node_modules/.bin`: build exit 0, artifact + 15 static files + 7 public files
+- Added `scripts/start.mjs`: rebuilds once when the artifact is missing (so a host whose build step is skipped or aborted still boots), and mirrors output to `server.log` without swallowing the exit status — the old `| tee server.log` always exited 0, so a crashed server looked like a clean shutdown to the supervisor. Crash → exit 3, SIGTERM → 143 (forwarded to the child), missing artifact → rebuild then boot (200)
+- Found a second, independent deploy blocker while smoke-testing the artifact: `GET /api/public/tenants` returned 500 with Prisma `Error code 14: Unable to open the database file`. Prisma resolves a relative `file:` URL against `prisma/schema.prisma`, so the workspace's `DATABASE_URL=file:./db/custom.db` was looked up as `prisma/db/custom.db` — broken in dev and in the standalone build alike. `src/lib/db.ts` now anchors a relative SQLite path to the app root (two levels above `.next/standalone`), and `scripts/start.mjs` resolves it to an absolute path by walking up from the project root, so any layout holding `db/custom.db` at or above the app root works
+- Kept the lookup out of the traced server bundle: an `fs.existsSync` walk-up in `src/lib/db.ts` made Turbopack trace and ship the entire project (143 MB standalone + whole-project warning); moving it into the untraced start wrapper removed the warning (138 MB, 1166 traced files)
+- Verified the artifact with the untouched relative `.env`: `npm start` → 200 `/`, 200 `/api/public/tenants`; direct `node .next/standalone/server.js` → 200; a host-provided absolute DATABASE_URL is left untouched; a missing database file is logged in plain language. `tsc --noEmit` exit 0, eslint exit 0, build exit 0 with no warnings
+- Pushed the SMS provider + admin work plus these deploy fixes to GitHub (origin/main, rnetis/nobatyar)
+
+Stage Summary:
+- The deploy no longer depends on $PATH for prisma/next, and a half-finished build can no longer pass silently: the build asserts its own artifact, and start rebuilds and boots if the artifact is absent
+- `.env` is intentionally NOT committed: it is tracked upstream and carries ADMIN_PASSWORD / SESSION_SECRET — rotate those and untrack the file separately. The deployed value comes from the workspace, which holds the relative `DATABASE_URL`
