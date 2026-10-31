@@ -10,10 +10,11 @@ import { faDigits, faNumber, formatJalaliFull, minutesFa } from '@/lib/jalali'
 import { QueueSection } from './queue-board'
 import { AppointmentsSection } from './appointments'
 import { ServicesSection, StaffSection } from './services'
+import { BranchesSection } from './branches'
 import { CustomersSection } from './customers'
 import { SettingsSection, SmsSection, AuditSection } from './settings'
 import {
-  LayoutDashboard, ListOrdered, CalendarClock, Briefcase, UsersRound,
+  LayoutDashboard, ListOrdered, CalendarClock, Briefcase, UsersRound, Building2,
   Settings, MessageSquareText, History, LogOut, Radio, TrendingUp, UserRoundSearch,
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -26,6 +27,7 @@ const NAV = [
   { key: 'dashboard', label: 'داشبورد', icon: LayoutDashboard },
   { key: 'queue', label: 'مدیریت صف', icon: ListOrdered, live: true },
   { key: 'appointments', label: 'نوبت‌ها', icon: CalendarClock },
+  { key: 'branches', label: 'شعبه‌ها', icon: Building2 },
   { key: 'services', label: 'خدمات', icon: Briefcase },
   { key: 'staff', label: 'کارکنان', icon: UsersRound },
   { key: 'customers', label: 'مشتریان', icon: UserRoundSearch },
@@ -167,6 +169,7 @@ export function PanelShell({ section }: { section?: string }) {
           {active === 'dashboard' && <Dashboard />}
           {active === 'queue' && <QueueSection />}
           {active === 'appointments' && <AppointmentsSection />}
+          {active === 'branches' && <BranchesSection />}
           {active === 'services' && <ServicesSection />}
           {active === 'staff' && <StaffSection />}
           {active === 'customers' && <CustomersSection />}

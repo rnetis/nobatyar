@@ -43,6 +43,22 @@ export function parseHours(hoursJson: string): Record<string, DayHours> {
   }
 }
 
+/** Validate a branch `hours` JSON string. Returns an error message, or null when valid. */
+export function validateHoursJson(json: string): string | null {
+  let p: unknown
+  try { p = JSON.parse(json) } catch { return 'ساعات کاری نامعتبر است' }
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return 'ساعات کاری نامعتبر است'
+  const re = /^([01]\d|2[0-3]):[0-5]\d$/
+  for (const [day, v] of Object.entries(p as Record<string, DayHours>)) {
+    if (!(DAY_KEYS as readonly string[]).includes(day) || !v || typeof v !== 'object') return 'ساعات کاری نامعتبر است'
+    if (v.closed === true) continue
+    if (!re.test(String(v.open)) || !re.test(String(v.close)) || timeToMinutes(v.open) >= timeToMinutes(v.close)) {
+      return 'ساعت شروع هر روز باید قبل از ساعت پایان باشد'
+    }
+  }
+  return null
+}
+
 /** How far ahead customers may book (days). */
 export const MAX_ADVANCE_DAYS = 60
 

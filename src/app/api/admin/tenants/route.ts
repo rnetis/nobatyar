@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { defaultHours } from '@/lib/availability'
 import { requireSuperAdminSession, setSessionCookie } from '@/lib/auth'
 import type { SmsProviderId } from '@/lib/sms'
 
@@ -61,6 +62,14 @@ export async function POST(req: Request) {
 
   // Create path: new tenant (optionally with initial SMS config)
   if (!name) return NextResponse.json({ error: 'نام مرکز الزامی است' }, { status: 400 })
+  // fail BEFORE creating anything: the old order created the tenant first and then returned 409
+  // for a duplicate owner e-mail, leaving an orphan tenant behind
+  if (ownerEmail && (await db.user.findUnique({ where: { email: ownerEmail.toLowerCase() } }))) {
+    return NextResponse.json({ error: 'کاربری با این ایمیل قبلاً ثبت شده است' }, { status: 409 })
+  }
+  if (planId && !(await db.plan.findUnique({ where: { id: planId } }))) {
+    return NextResponse.json({ error: 'پلن نامعتبر است' }, { status: 400 })
+  }
   const slug = `t-${crypto.randomUUID().slice(0, 8)}`
   const tenant = await db.tenant.create({
     data: {
@@ -70,6 +79,8 @@ export async function POST(req: Request) {
       logoText: (name || 'M').slice(0, 1),
       planId: planId || null,
       smsConfig: smsConfig ? JSON.stringify(sanitizeSmsConfig(smsConfig)) : '{}',
+      // every new tenant starts with one bookable branch (Sat–Thu 09–18) so it works out of the box
+      branches: { create: { name: 'شعبه اصلی', hours: JSON.stringify(defaultHours()) } },
     },
   })
   let createdOwnerPassword: string | undefined

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireBusinessSession, requireManagerSession } from '@/lib/auth'
 import { checkBranchLimit } from '@/lib/plan-limits'
+import { validateHoursJson } from '@/lib/availability'
 
 export async function GET() {
   const session = await requireBusinessSession()
@@ -19,15 +20,21 @@ export async function POST(req: Request) {
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const body = await req.json().catch(() => ({}))
   const { name, address, phone, hours, status } = body as Record<string, unknown>
-  if (!name || typeof name !== 'string') return NextResponse.json({ error: 'نام شعبه الزامی است' }, { status: 400 })
-  const limitError = await checkBranchLimit(session.tenantId)
+  if (!name || typeof name !== 'string' || !name.trim()) return NextResponse.json({ error: 'نام شعبه الزامی است' }, { status: 400 })
+  if (typeof hours === 'string' && hours !== '{}') {
+    const hoursError = validateHoursJson(hours)
+    if (hoursError) return NextResponse.json({ error: hoursError }, { status: 400 })
+  }
+  // an INACTIVE branch doesn't use plan capacity, so only ACTIVE creations are limited
+  const wantsActive = status === undefined || String(status) === 'ACTIVE'
+  const limitError = wantsActive ? await checkBranchLimit(session.tenantId) : null
   if (limitError) return NextResponse.json({ error: limitError }, { status: 403 })
-  const existing = await db.branch.count({ where: { tenantId: session.tenantId, name } })
+  const existing = await db.branch.count({ where: { tenantId: session.tenantId, name: name.trim() } })
   if (existing > 0) return NextResponse.json({ error: 'شعبه‌ای با این نام قبلاً ساخته شده' }, { status: 409 })
   const branch = await db.branch.create({
     data: {
       tenantId: session.tenantId,
-      name: String(name),
+      name: name.trim().slice(0, 100),
       address: (address !== undefined && typeof address === 'string') ? String(address) : null,
       phone: (phone !== undefined && typeof phone === 'string') ? String(phone) : null,
       hours: (hours !== undefined && typeof hours === 'string') ? String(hours) : '{}',
@@ -53,7 +60,8 @@ export async function PATCH(req: Request) {
     if (limitError) return NextResponse.json({ error: limitError }, { status: 403 })
   }
   if (typeof hours === 'string') {
-    try { if (typeof JSON.parse(hours) !== 'object') throw new Error('x') } catch { return NextResponse.json({ error: 'ساعات کاری نامعتبر است' }, { status: 400 }) }
+    const hoursError = validateHoursJson(hours)
+    if (hoursError) return NextResponse.json({ error: hoursError }, { status: 400 })
   }
   const updated = await db.branch.update({
     where: { id: id as string },

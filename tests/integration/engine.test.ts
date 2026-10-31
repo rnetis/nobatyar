@@ -289,3 +289,52 @@ async function walkIns(queueId: string, n: number): Promise<string[]> {
   }
   return out
 }
+
+// ───────── branch management ─────────
+import { POST as branchPost, PATCH as branchPatch, GET as branchGet } from '@/app/api/business/branches/route'
+
+test('client (owner) can add branches; plan limit counts ACTIVE only and reports a clear error', async () => {
+  const plan = await db.plan.create({ data: { name: 'two', slug: 'two', maxBranches: 2, maxStaff: 5, maxBookings: 100, smsQuota: 10 } })
+  const t = await db.tenant.create({ data: { name: 'two', slug: 'two', planId: plan.id } })
+  const owner = await db.user.create({ data: { tenantId: t.id, name: 'o', email: 'o@two.ir', passwordHash: 'x', role: 'TENANT_OWNER' } })
+  setSession({ userId: owner.id, name: 'o', role: 'TENANT_OWNER', tenantId: t.id })
+  const hours = JSON.stringify(ALL_DAYS)
+
+  const r1 = await branchPost(req({ name: 'شعبه ۱', hours }))
+  assert.equal(r1.status, 200, await r1.clone().text())
+  const r2 = await branchPost(req({ name: 'شعبه ۲', hours }))
+  assert.equal(r2.status, 200)
+  const r3 = await branchPost(req({ name: 'شعبه ۳', hours }))
+  assert.equal(r3.status, 403)
+  assert.match((await r3.json()).error, /سقف شعبه‌ها/)
+  // an INACTIVE branch does not use capacity
+  assert.equal((await branchPost(req({ name: 'بایگانی', hours, status: 'INACTIVE' }))).status, 200)
+  // …but re-activating it would exceed the limit
+  const inactive = await db.branch.findFirst({ where: { tenantId: t.id, name: 'بایگانی' } })
+  assert.equal((await branchPatch(patchReq({ id: inactive!.id, status: 'ACTIVE' }))).status, 403)
+  // duplicate name
+  assert.equal((await branchPost(req({ name: 'شعبه ۱', hours, status: 'INACTIVE' }))).status, 409)
+  assert.equal(((await (await branchGet()).json()).branches as unknown[]).length, 3)
+
+  // reset session for the other tests
+  const o1 = await db.user.findFirst({ where: { tenantId: T.id } })
+  setSession({ userId: o1!.id, name: 'owner', role: 'TENANT_OWNER', tenantId: T.id })
+})
+
+test('branch hours are validated; non-managers cannot add branches', async () => {
+  const bad = (h: unknown) => branchPost(req({ name: `b${Math.random()}`, hours: JSON.stringify(h) }))
+  assert.equal((await bad({ sat: { open: '18:00', close: '09:00', closed: false } })).status, 400)
+  assert.equal((await bad({ xyz: { open: '09:00', close: '10:00', closed: false } })).status, 400)
+  assert.equal((await bad({ sat: { open: '9am', close: '10:00', closed: false } })).status, 400)
+  assert.equal((await bad({ sat: { open: '09:00', close: '17:00', closed: false }, fri: { open: '00:00', close: '00:00', closed: true } })).status, 200)
+  const u = await db.user.findFirst({ where: { tenantId: T.id } })
+  setSession({ userId: u!.id, name: 'op', role: 'OPERATOR', tenantId: T.id })
+  assert.equal((await branchPost(req({ name: 'nope' }))).status, 403)
+  setSession({ userId: u!.id, name: 'owner', role: 'TENANT_OWNER', tenantId: T.id })
+})
+
+test('a freshly created branch is immediately bookable', async () => {
+  const b = await (await branchPost(req({ name: 'تازه', hours: JSON.stringify({ sat: { open: '09:00', close: '17:00', closed: false }, sun: { open: '09:00', close: '17:00', closed: false }, mon: { open: '09:00', close: '17:00', closed: false }, tue: { open: '09:00', close: '17:00', closed: false }, wed: { open: '09:00', close: '17:00', closed: false }, thu: { open: '09:00', close: '17:00', closed: false }, fri: { open: '09:00', close: '17:00', closed: false } }) }))).json()
+  const r = await book(req(bookBody({ branchId: b.branch.id, time: '09:30', date: dayKey(8) })))
+  assert.equal(r.status, 200, await r.clone().text())
+})
