@@ -10,10 +10,10 @@ Persian (RTL) multi-tenant SaaS platform for appointment booking, live queue man
 
 | Panel | URL | Email | Password |
 |---|---|---|---|
-| Super Admin | `/#/admin` | `admin@nobaas.ir` | `bGlTpdcV36FMshh5Aa1!` |
+| Super Admin | `/#/admin` | value of `ADMIN_EMAIL` | value of `ADMIN_PASSWORD` |
 
 - Business/tenant accounts are created through the Super Admin panel → **Tenants → ایجاد Tenant**. A strong one-time initial password is generated automatically and shown **once** to the platform admin.
-- To rotate the admin password, change `ADMIN_PASSWORD` in `.env` and re-run the seed (`pnpm seed`), or update the hash directly in the database.
+- To rotate the admin password, change `ADMIN_PASSWORD` in `.env` and re-run `pnpm seed`. The seed is idempotent: it rotates the admin password and never touches tenant data. (`pnpm seed -- --reset` wipes everything — development only.)
 
 ---
 
@@ -58,6 +58,8 @@ npm install && node index.ts   # WS :3003, broadcast API :3004
 | `SESSION_SECRET` | ✅ | HMAC secret for session cookies. Generate: `openssl rand -hex 32`. The app refuses to sign sessions without it. |
 | `ADMIN_EMAIL` | ✅ (seed) | Platform super admin email |
 | `ADMIN_PASSWORD` | ✅ (seed) | Platform super admin password (min 10 chars) |
+| `BROADCAST_SECRET` | ✅ prod | Shared secret between the API and the queue mini-service; the mini-service rejects unauthenticated `/broadcast` calls. Set the same value on both processes. |
+| `COOKIE_SECURE` | optional | Force `Secure` cookies (default: on when `NEXT_PUBLIC_BASE_URL` is https in production) |
 | `NEXT_PUBLIC_BASE_URL` | recommended | Public origin used in SMS live-queue links |
 | `QUEUE_SERVICE_URL` | optional | Broadcast API of the queue mini-service (default `http://localhost:3004`) |
 | `SMSIR_API_KEY` | for SMS | sms.ir API key (`X-API-KEY`). Leave empty to keep messages in the outbox. |
@@ -153,4 +155,10 @@ Verify authenticity with the `X-Nobaar-Signature` header (HMAC-SHA256 of the raw
 - **No demo data**: the seed no longer creates demo tenants, customers, appointments, queues, notifications, tickets or audit logs. Only the 4 subscription plans and the super admin account.
 - **No demo credentials in the UI**: the landing page login dialogs no longer include demo quick-fill buttons.
 - **Session secret required**: the app fails closed (no session cookies) if `SESSION_SECRET` is unset.
+- **Secrets**: `.env` and `db/custom.db` are no longer tracked. If a previous version of this repo was ever public or shared, treat its `SESSION_SECRET` and super-admin password as compromised: rotate both and purge them from git history.
+- **Passwords**: scrypt with a per-user salt; legacy hashes are upgraded transparently on next login. Login, booking, lookup and cancel endpoints are rate-limited.
+- **Roles**: only `TENANT_OWNER` / `TENANT_ADMIN` / `MANAGER` may change settings, services, staff, branches or hide audit entries; `OPERATOR` / `STAFF` run the queue.
+- **Plan limits** (branches, staff, bookings per Jalali month, SMS quota) are enforced server-side.
+- **Gateway**: only websocket port 3003 is exposed through Caddy (`XTransformPort`); the broadcast API (3004) is loopback-only.
+- **Timezone**: the process is pinned to `Asia/Tehran` (`src/instrumentation.ts`).
 - **Tenant onboarding**: initial passwords are randomly generated (never hardcoded) and shown once to the platform admin.

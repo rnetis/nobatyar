@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { requireBusinessSession } from '@/lib/auth'
+import { requireBusinessSession, requireManagerSession } from '@/lib/auth'
+import { checkBranchLimit } from '@/lib/plan-limits'
 
 export async function GET() {
   const session = await requireBusinessSession()
@@ -14,11 +15,13 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const body = await req.json().catch(() => ({}))
   const { name, address, phone, hours, status } = body as Record<string, unknown>
   if (!name || typeof name !== 'string') return NextResponse.json({ error: 'نام شعبه الزامی است' }, { status: 400 })
+  const limitError = await checkBranchLimit(session.tenantId)
+  if (limitError) return NextResponse.json({ error: limitError }, { status: 403 })
   const existing = await db.branch.count({ where: { tenantId: session.tenantId, name } })
   if (existing > 0) return NextResponse.json({ error: 'شعبه‌ای با این نام قبلاً ساخته شده' }, { status: 409 })
   const branch = await db.branch.create({
@@ -38,13 +41,20 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const body = await req.json().catch(() => ({}))
   const { id, name, address, phone, hours, status } = body as Record<string, unknown>
   if (!id) return NextResponse.json({ error: 'شناسه شعبه الزامی است' }, { status: 400 })
   const existing = await db.branch.findUnique({ where: { id: id as string } })
   if (!existing || existing.tenantId !== session.tenantId) return NextResponse.json({ error: 'شعبه یافت نشد' }, { status: 404 })
+  if (status === 'ACTIVE' && existing.status !== 'ACTIVE') {
+    const limitError = await checkBranchLimit(session.tenantId)
+    if (limitError) return NextResponse.json({ error: limitError }, { status: 403 })
+  }
+  if (typeof hours === 'string') {
+    try { if (typeof JSON.parse(hours) !== 'object') throw new Error('x') } catch { return NextResponse.json({ error: 'ساعات کاری نامعتبر است' }, { status: 400 }) }
+  }
   const updated = await db.branch.update({
     where: { id: id as string },
     data: {
@@ -62,7 +72,7 @@ export async function PATCH(req: Request) {
 }
 
 export async function DELETE(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const url = new URL(req.url)
   const id = url.searchParams.get('id')

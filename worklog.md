@@ -60,3 +60,28 @@ Work Log:
 Stage Summary:
 - The deploy no longer depends on $PATH for prisma/next, and a half-finished build can no longer pass silently: the build asserts its own artifact, and start rebuilds and boots if the artifact is absent
 - `.env` is intentionally NOT committed: it is tracked upstream and carries ADMIN_PASSWORD / SESSION_SECRET — rotate those and untrack the file separately. The deployed value comes from the workspace, which holds the relative `DATABASE_URL`
+
+---
+Task ID: 4
+Agent: (continuation)
+Task: Same deploy, next round — the host built a tree with no node_modules at all (`cannot find the "prisma" CLI inside node_modules`, then `.env not found` at start)
+
+Work Log:
+- The second deploy log showed the new diagnostics naming the real condition instead of `sh: prisma: not found`: `npm run build` found no prisma CLI, and `npm start` reported both `.env not found` and the same missing CLI. So the host's tree had no node_modules, no .env and no .next artifact
+- Root cause identified from `.gitignore`: the host packs only files that are NOT ignored — `node_modules` (L4), `/.next/` (L17) and `.env*` (L34) are all ignored, so none of the three could ever be present. `db/custom.db` is not ignored, so the database does ship. Its own dependency install never ran (a `npm ci`-style step dies instantly without a lockfile — verified here: EUSAGE, exit 1, no node_modules; the panel then ran the build anyway)
+- Fix 1 — `scripts/build.mjs` `installDependencies()`: when `prisma`/`next` cannot be resolved from node_modules, the build installs what it is about to run (`npm install --include=dev --no-audit --no-fund`, output echoed, one retry with `--legacy-peer-deps` only if npm reports ERESOLVE, since pnpm/bun accept trees npm rejects). `--include=dev` is required: npm omits devDependencies under NODE_ENV=production and `next build` reads tailwindcss, @tailwindcss/postcss and typescript from there. `scripts/start.mjs` inherits this through `build()`
+- Fix 2 — `scripts/start.mjs`: when DATABASE_URL is unset, log which required variables are missing (`DATABASE_URL`, `SESSION_SECRET`) instead of letting every database route fail with a bare Prisma error. `.env` can never ship, so these must come from the host environment
+- Verified against a replica of the host tree (workspace tarred minus gitignored files: no node_modules, no .env, no .next) running the host's own commands, with a stub package manager standing in for a slow registry:
+  - install fails → exit 1, `node_modules is still empty after \`npm install\``, and prisma/next never ran (no silent success)
+  - install succeeds → exit 0, `.next/standalone/server.js` PRESENT with 15 static + 7 public files — this also proves `next build` succeeds with no `.env` present
+  - `npm start` with no artifact → rebuilds, then serves: `/` 200, `/api/public/tenants` 200
+  - host as-is (no env vars) → `/` 200 but `/api/public/tenants` 500 `PrismaClientInitializationError`, plus the new `[start]` warning naming both missing variables
+  - `DATABASE_URL=file:./db/custom.db` → `[start] DATABASE_URL -> file:…/db/custom.db` (anchored absolute) and tenants 200
+  - SIGTERM to the wrapper → port freed in 0s, exit 143. Sent to `npm start` instead, the tree stays up: npm and its `sh -c` do not forward SIGTERM, so only a supervisor kill (or a direct start command) tears it down
+- Real project re-checked after the edits: `npm run build` exit 0 with the install path short-circuiting (node_modules is complete), artifact served `/` 200 + `/api/public/tenants` 200 from the workspace `.env`, `node --check` and `eslint` exit 0
+- Host-side action still required: set `DATABASE_URL` (e.g. `file:./db/custom.db`) and `SESSION_SECRET` in the panel's environment, otherwise the deploy boots but database routes and sign-in fail
+
+Stage Summary:
+- The build is now self-sufficient on a host that installs nothing: it installs dependencies, builds, and fails loudly and specifically at whichever step breaks
+- `npm start` still self-heals a missing artifact, and now says which env vars the host must supply
+- Changes are in the working tree only (not committed); the host deploys the workspace, so a redeploy picks them up

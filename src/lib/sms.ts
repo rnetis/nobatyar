@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { hasSmsQuota } from '@/lib/plan-limits'
 import { formatJalaliFull, formatTime, faDigits, minutesFa } from '@/lib/jalali'
 
 /**
@@ -91,7 +92,7 @@ export interface TemplateVars {
 }
 
 export function renderTemplate(tpl: string, vars: TemplateVars): string {
-  return tpl.replace(/\{\{(\w+)\}\}/g, (_, key: string) => {
+  return tpl.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key: string) => {
     const v = (vars as Record<string, string | undefined>)[key]
     return v !== undefined ? v : ''
   })
@@ -198,6 +199,9 @@ export async function queueNotification(args: {
       type: args.type,
       vars: args.vars,
     })
+    // Plan SMS quota (per Jalali month). Over-quota messages are kept in the outbox as FAILED
+    // so the business can see what was not delivered — nothing is silently dropped.
+    const overQuota = !(await hasSmsQuota(args.tenantId))
     const created = await db.notification.create({
       data: {
         tenantId: args.tenantId,
@@ -206,9 +210,13 @@ export async function queueNotification(args: {
         channel: 'SMS',
         recipient: args.recipient,
         body,
-        status: 'PENDING',
+        status: overQuota ? 'FAILED' : 'PENDING',
       },
     })
+    if (overQuota) {
+      console.warn(`sms quota exceeded for tenant ${args.tenantId}; message ${created.id} not sent`)
+      return
+    }
 
     // Resolve the SMS provider: tenant config first, then platform env, else disabled
     const provider = resolveSmsProvider(tenant)

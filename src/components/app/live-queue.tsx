@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { apiGet } from './api-client'
+import { apiGet, apiPost } from './api-client'
 import { subscribeQueue } from './socket'
 import { faDigits, minutesFa, formatTime, formatJalaliMedium } from '@/lib/jalali'
 import { APPOINTMENT_STATUS_FA, PRIORITY_FA } from './labels'
@@ -100,6 +100,16 @@ export function LiveQueue({ token }: { token: string }) {
   const done = ['COMPLETED', 'CANCELLED', 'NO_SHOW', 'SKIPPED'].includes(appointment.status)
   const queueClosed = queue?.status === 'CLOSED'
   const queuePaused = queue?.status === 'PAUSED'
+  const canCancel = ['PENDING', 'CONFIRMED', 'WAITING'].includes(appointment.status)
+  const handleCancel = async () => {
+    if (!window.confirm('آیا از لغو این نوبت مطمئن هستید؟')) return
+    try {
+      await apiPost(`/api/public/queue/${token}/cancel`, {})
+      void refetch()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'خطا در لغو نوبت')
+    }
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-[#fafafa]">
@@ -238,6 +248,12 @@ export function LiveQueue({ token }: { token: string }) {
             </div>
           </div>
         </div>
+
+        {canCancel && (
+          <button onClick={handleCancel} className="mt-6 block text-sm font-bold text-[#ef4444] hover:underline">
+            لغو این نوبت
+          </button>
+        )}
 
         <a href="#/" className="mt-6 inline-flex items-center gap-1.5 text-sm font-bold text-[#525252] hover:text-[#ef4444] transition-colors">
           <ArrowRight className="w-4 h-4" />

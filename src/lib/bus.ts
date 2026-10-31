@@ -22,7 +22,10 @@ export async function broadcast(rooms: string[], event: string, data: unknown): 
   try {
     await fetch(`${BUS_URL}/broadcast`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(process.env.BROADCAST_SECRET ? { 'x-internal-token': process.env.BROADCAST_SECRET } : {}),
+      },
       body: JSON.stringify({ rooms, event, data }),
       signal: AbortSignal.timeout(1500),
     })

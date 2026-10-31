@@ -189,8 +189,17 @@ function ApptActions({ appt, onReschedule }: { appt: Appt; onReschedule: () => v
     onError: (e) => toast({ title: e instanceof Error ? e.message : 'خطا', variant: 'destructive' }),
   })
 
-  const canCheckin = ['CONFIRMED', 'PENDING'].includes(appt.status)
-  const canCancel = !['CANCELLED', 'COMPLETED', 'NO_SHOW'].includes(appt.status)
+  // mirrors the server-side state machine in /api/business/appointments
+  const canCheckin = ['CONFIRMED', 'PENDING', 'SKIPPED', 'NO_SHOW'].includes(appt.status)
+  const canCancel = ['PENDING', 'CONFIRMED', 'WAITING', 'CALLED', 'SKIPPED'].includes(appt.status)
+  const canNoShow = ['PENDING', 'CONFIRMED', 'WAITING', 'CALLED'].includes(appt.status)
+  const canReschedule = ['PENDING', 'CONFIRMED', 'WAITING', 'SKIPPED', 'NO_SHOW'].includes(appt.status)
+  // tenants may require a reason; ask for it (cancel the prompt to abort)
+  const withReason = (action: 'cancel' | 'no_show', question: string) => {
+    const reason = window.prompt(question)
+    if (reason === null) return
+    act.mutate({ action, reason: reason.trim() || undefined })
+  }
 
   return (
     <div className="flex items-center gap-1">
@@ -200,10 +209,10 @@ function ApptActions({ appt, onReschedule }: { appt: Appt; onReschedule: () => v
       {appt.status === 'PENDING' && (
         <IconBtn title="تأیید" onClick={() => act.mutate({ action: 'confirm' })}><CheckCheck className="w-3.5 h-3.5" /></IconBtn>
       )}
-      <IconBtn title="جابجایی زمان" onClick={onReschedule}><CalendarRange className="w-3.5 h-3.5" /></IconBtn>
-      {canCancel && <IconBtn title="لغو" onClick={() => act.mutate({ action: 'cancel' })}><Ban className="w-3.5 h-3.5 text-[#ef4444]" /></IconBtn>}
-      {!canCancel && appt.status === 'CONFIRMED' && (
-        <IconBtn title="عدم حضور" onClick={() => act.mutate({ action: 'no_show' })}><UserX className="w-3.5 h-3.5" /></IconBtn>
+      {canReschedule && <IconBtn title="جابجایی زمان" onClick={onReschedule}><CalendarRange className="w-3.5 h-3.5" /></IconBtn>}
+      {canCancel && <IconBtn title="لغو" onClick={() => withReason('cancel', 'دلیل لغو نوبت را وارد کنید:')}><Ban className="w-3.5 h-3.5 text-[#ef4444]" /></IconBtn>}
+      {canNoShow && (
+        <IconBtn title="عدم حضور" onClick={() => withReason('no_show', 'دلیل ثبت عدم حضور را وارد کنید:')}><UserX className="w-3.5 h-3.5" /></IconBtn>
       )}
     </div>
   )

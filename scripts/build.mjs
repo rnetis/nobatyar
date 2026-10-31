@@ -13,6 +13,13 @@
  * explicit check for the standalone entry point, means the build either
  * completes or exits non-zero naming the missing piece — it can no longer
  * "succeed" while producing nothing runnable.
+ *
+ * The 2026-10-12 deploy showed the other half of this: the host ran the build
+ * against a tree with no node_modules *at all*, so there was nothing to resolve.
+ * It copies only files that .gitignore does not exclude, and .gitignore excludes
+ * node_modules, .next and .env — so neither the build nor `npm start` could ever
+ * have worked on it. installDependencies() below installs what the build is
+ * about to run when the host's own install step did not.
  */
 import { spawnSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
@@ -23,6 +30,69 @@ import { fileURLToPath } from 'node:url'
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 const require = createRequire(import.meta.url)
+
+const PRISMA_ENTRY = 'prisma/build/index.js'
+const NEXT_ENTRY = 'next/dist/bin/next'
+
+/** Is a CLI resolvable from the project's node_modules, whatever pm layout installed it? */
+function hasCli(entry) {
+  try {
+    require.resolve(entry, { paths: [projectRoot] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Run a command, echo its output, and return it (null when it could not even start). */
+function capture(command, args) {
+  console.log(`\n▶ ${command} ${args.join(' ')}`)
+  const result = spawnSync(command, args, {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+  })
+  if (result.error) {
+    console.warn(`[build] could not run ${command}: ${result.error.message}`)
+    return null
+  }
+  if (result.stdout) process.stdout.write(result.stdout)
+  if (result.stderr) process.stderr.write(result.stderr)
+  if (result.status !== 0) console.warn(`[build] ${command} ${args[0]} exited with code ${result.status}`)
+  return `${result.stdout || ''}\n${result.stderr || ''}`
+}
+
+/**
+ * Install dependencies when the host did not.
+ *
+ * `--include=dev` is deliberate: npm omits devDependencies when NODE_ENV is
+ * production, and next build reads tailwindcss, @tailwindcss/postcss and
+ * typescript from there — a prod-only install fails the build (or ships
+ * unstyled HTML) on a host that exports NODE_ENV=production.
+ */
+function installDependencies() {
+  if (hasCli(PRISMA_ENTRY) && hasCli(NEXT_ENTRY)) return
+
+  console.warn('[build] node_modules has no prisma/next — installing dependencies before building.')
+  const install = ['install', '--include=dev', '--no-audit', '--no-fund']
+  let output = capture('npm', install)
+
+  // npm's strict peer resolution rejects trees that pnpm/bun install happily.
+  if (output !== null && /ERESOLVE|peer dep/i.test(output)) {
+    console.warn('[build] npm reported a peer-dependency conflict — retrying with --legacy-peer-deps.')
+    output = capture('npm', [...install, '--legacy-peer-deps'])
+  }
+
+  if (hasCli(PRISMA_ENTRY) && hasCli(NEXT_ENTRY)) {
+    console.log('[build] dependencies installed.')
+    return
+  }
+  throw new Error(
+    'node_modules is still empty after `npm install`.\n' +
+      "     the deploy host must allow network access during the build, or install\n" +
+      "     dependencies in its own build step before `npm run build`.",
+  )
+}
 
 /** Resolve a CLI inside node_modules, independent of $PATH and of npm/pnpm layouts. */
 function resolveCli(packageName, entry, howToFix) {
@@ -61,13 +131,15 @@ function copyInto(from, to) {
 }
 
 export function build() {
+  installDependencies()
+
   run(
     'prisma generate',
-    resolveCli('prisma', 'prisma/build/index.js', 'run `npm install` (prisma is a runtime dependency)'),
+    resolveCli('prisma', PRISMA_ENTRY, 'run `npm install` (prisma is a runtime dependency)'),
     ['generate'],
   )
 
-  run('next build', resolveCli('next', 'next/dist/bin/next', 'run `npm install` so next is present'), ['build'])
+  run('next build', resolveCli('next', NEXT_ENTRY, 'run `npm install` so next is present'), ['build'])
 
   const standalone = path.join(projectRoot, '.next', 'standalone')
   const serverEntry = path.join(standalone, 'server.js')

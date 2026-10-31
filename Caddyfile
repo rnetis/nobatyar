@@ -1,6 +1,8 @@
 :81 {
+	# Only the websocket port is reachable from outside. The old wildcard let any request
+	# reach ANY local port, including the unauthenticated broadcast API on 3004.
 	@transform_port_query {
-		query XTransformPort=*
+		query XTransformPort=3003
 	}
 
 	handle @transform_port_query {

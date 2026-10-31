@@ -1,5 +1,9 @@
 import { createHmac, timingSafeEqual } from 'crypto'
 import { cookies } from 'next/headers'
+import { db } from '@/lib/db'
+import { hashPassword, verifyPassword } from '@/lib/password'
+
+export { hashPassword, verifyPassword }
 
 const SECRET = process.env.SESSION_SECRET
 const COOKIE_NAME = 'nobaas_sess'
@@ -16,11 +20,6 @@ export interface SessionPayload {
 function sign(data: string): string {
   if (!SECRET) throw new Error('SESSION_SECRET is not configured')
   return createHmac('sha256', SECRET).update(data).digest('base64url')
-}
-
-export function hashPassword(password: string): string {
-  const salt = createHmac('sha256', 'nobaas:pwd-salt').update('static-v1').digest('hex').slice(0, 32)
-  return createHmac('sha256', salt).update(`nobaas:${password}`).digest('hex')
 }
 
 export function createSessionToken(payload: SessionPayload): string {
@@ -58,6 +57,9 @@ export async function setSessionCookie(payload: Omit<SessionPayload, 'iat'>): Pr
   store.set(COOKIE_NAME, createSessionToken({ ...payload, iat: Date.now() }), {
     httpOnly: true,
     sameSite: 'lax',
+    secure: process.env.COOKIE_SECURE
+      ? process.env.COOKIE_SECURE === 'true'
+      : process.env.NODE_ENV === 'production' && (process.env.NEXT_PUBLIC_BASE_URL || '').startsWith('https://'),
     path: '/',
     maxAge: 7 * 24 * 3600,
   })
@@ -68,12 +70,38 @@ export async function clearSessionCookie(): Promise<void> {
   store.delete(COOKIE_NAME)
 }
 
+export const MANAGER_ROLES = ['TENANT_OWNER', 'TENANT_ADMIN', 'MANAGER'] as const
+const BUSINESS_ROLES = ['TENANT_OWNER', 'TENANT_ADMIN', 'MANAGER', 'OPERATOR', 'STAFF']
+
+/**
+ * Re-validate the signed cookie against the database so that disabling a user,
+ * changing a role or suspending a tenant takes effect immediately instead of
+ * after the 7-day token expiry.
+ */
+async function liveUser(s: SessionPayload) {
+  return db.user.findUnique({
+    where: { id: s.userId },
+    select: { status: true, role: true, tenantId: true, tenant: { select: { status: true } } },
+  })
+}
+
 /** Guard for business-panel APIs (tenant-scoped roles) */
 export async function requireBusinessSession(): Promise<SessionPayload | null> {
   const s = await getSession()
   if (!s) return null
   if (!s.tenantId && !s.impersonating) return null
-  if (!['TENANT_OWNER', 'TENANT_ADMIN', 'MANAGER', 'OPERATOR', 'STAFF'].includes(s.role)) return null
+  const u = await liveUser(s)
+  if (!u || u.status !== 'ACTIVE') return null
+  if (!s.impersonating && u.tenant?.status === 'SUSPENDED') return null
+  const role = u.role
+  if (!BUSINESS_ROLES.includes(role)) return null
+  return { ...s, role, tenantId: u.tenantId ?? s.tenantId }
+}
+
+/** Business session that must also hold a management role (settings, services, staff, branches, audit). */
+export async function requireManagerSession(): Promise<SessionPayload | null> {
+  const s = await requireBusinessSession()
+  if (!s || !(MANAGER_ROLES as readonly string[]).includes(s.role)) return null
   return s
 }
 
@@ -82,11 +110,19 @@ export async function requireAdminSession(): Promise<SessionPayload | null> {
   const s = await getSession()
   if (!s) return null
   if (!['SUPER_ADMIN', 'SUPPORT'].includes(s.role)) return null
-  return s
+  const u = await liveUser(s)
+  if (!u || u.status !== 'ACTIVE' || !['SUPER_ADMIN', 'SUPPORT'].includes(u.role)) return null
+  return { ...s, role: u.role }
 }
 
 export async function requireSuperAdminSession(): Promise<SessionPayload | null> {
-  const s = await getSession()
+  const s = await requireAdminSession()
   if (!s || s.role !== 'SUPER_ADMIN') return null
   return s
+}
+
+// ── Short-lived token authorising a socket to join a tenant room ──
+export function createSocketToken(tenantId: string, ttlMs = 10 * 60 * 1000): string {
+  const body = Buffer.from(JSON.stringify({ tid: tenantId, exp: Date.now() + ttlMs })).toString('base64url')
+  return `${body}.${sign('socket:' + body)}`
 }

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { requireBusinessSession } from '@/lib/auth'
+import { requireBusinessSession, requireManagerSession } from '@/lib/auth'
 
 /** Tenant notification & cancellation settings (PRD §17, §21) */
 export async function GET() {
@@ -15,7 +15,12 @@ export async function GET() {
   try {
     const parsed = JSON.parse(tenant.smsConfig || '{}') as { provider?: string; config?: Record<string, string> }
     if (parsed && typeof parsed === 'object' && parsed.provider) {
-      smsConfig = { provider: parsed.provider, config: parsed.config }
+      // never send provider secrets back to the browser (any staff role can call this endpoint)
+      const masked: Record<string, string> = {}
+      for (const [k, v] of Object.entries(parsed.config || {})) {
+        masked[k] = /key|secret|token|password/i.test(k) && typeof v === 'string' && v ? `••••${v.slice(-4)}` : v
+      }
+      smsConfig = { provider: parsed.provider, config: masked }
     }
   } catch { /* noop */ }
   let notificationTemplates: Record<string, string> = {}
@@ -35,7 +40,7 @@ export async function GET() {
 }
 
 export async function PATCH(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const body = await req.json().catch(() => ({}))
   const { notifPolicy, cancelPolicy, reasonRequired } = body as {

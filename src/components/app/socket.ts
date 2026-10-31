@@ -57,23 +57,35 @@ export function subscribeQueue(
   }
 }
 
-/** Join a tenant room (Business Panel live board). */
+/**
+ * Join a tenant room (Business Panel live board).
+ * The server only lets a socket into a tenant room when it presents a short-lived signed token
+ * issued to an authenticated session (previously anybody could `watch` any tenant id).
+ */
 export function watchTenant(
   tenantId: string,
   onUpdate: () => void,
 ): () => void {
   const s = getSocket()
+  let cancelled = false
+  const join = async () => {
+    try {
+      const res = await fetch('/api/business/socket-token', { cache: 'no-store' })
+      if (!res.ok || cancelled) return
+      const { token } = (await res.json()) as { token: string }
+      s.emit('watch', { tenantId, token })
+    } catch { /* offline: next reconnect retries */ }
+  }
   const handleConnect = () => {
-    s.emit('watch', { tenantId })
+    void join()
     onUpdate()
   }
   s.on('connect', handleConnect)
-  if (s.connected) {
-    s.emit('watch', { tenantId })
-  }
+  if (s.connected) void join()
   s.on('queue.updated', onUpdate)
   s.on('queue.activity', onUpdate)
   return () => {
+    cancelled = true
     s.off('connect', handleConnect)
     s.off('queue.updated', onUpdate)
     s.off('queue.activity', onUpdate)

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { hashPassword, setSessionCookie } from '@/lib/auth'
+import { hashPassword, verifyPassword, setSessionCookie } from '@/lib/auth'
+import { rateLimit, clientIp } from '@/lib/rate-limit'
 
 /** Login for Business & Super Admin panels */
 export async function POST(req: Request) {
@@ -16,12 +17,27 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'ایمیل و رمز عبور الزامی است' }, { status: 400 })
   }
 
+  // brute-force protection: per-IP and per-account
+  const ip = rateLimit(`login:ip:${clientIp(req)}`, 30, 15 * 60_000)
+  const acct = rateLimit(`login:acct:${email}`, 8, 15 * 60_000)
+  if (!ip.ok || !acct.ok) {
+    return NextResponse.json(
+      { error: 'تعداد تلاش‌های ورود زیاد است؛ چند دقیقه بعد دوباره تلاش کنید' },
+      { status: 429, headers: { 'Retry-After': String(Math.max(ip.retryAfterSec, acct.retryAfterSec)) } },
+    )
+  }
+
   const user = await db.user.findUnique({
     where: { email },
     include: { tenant: { select: { id: true, name: true, slug: true, status: true } } },
   })
-  if (!user || user.passwordHash !== hashPassword(password) || user.status !== 'ACTIVE') {
+  const check = user ? verifyPassword(password, user.passwordHash) : { ok: false, needsRehash: false }
+  if (!user || !check.ok || user.status !== 'ACTIVE') {
     return NextResponse.json({ error: 'ایمیل یا رمز عبور اشتباه است' }, { status: 401 })
+  }
+  if (check.needsRehash) {
+    // transparently upgrade legacy static-salt hashes to per-user scrypt
+    await db.user.update({ where: { id: user.id }, data: { passwordHash: hashPassword(password) } })
   }
   if (user.tenant && user.tenant.status === 'SUSPENDED') {
     return NextResponse.json({ error: 'حساب این کسب‌وکار موقتاً تعلیق شده است' }, { status: 403 })

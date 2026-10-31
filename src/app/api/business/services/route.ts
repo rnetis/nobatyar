@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { requireBusinessSession } from '@/lib/auth'
+import { requireBusinessSession, requireManagerSession } from '@/lib/auth'
 
 /** Services CRUD (PRD §24 Service Management) */
 export async function GET() {
@@ -15,11 +15,20 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const body = await req.json().catch(() => ({}))
   const { name, description, duration, price, capacity, branchId } = body as Record<string, unknown>
   if (!name || typeof name !== 'string') return NextResponse.json({ error: 'نام خدمت الزامی است' }, { status: 400 })
+  const dur = Number(duration)
+  const prc = Number(price)
+  if ((duration !== undefined && (!Number.isFinite(dur) || dur < 5 || dur > 600)) || (price !== undefined && (!Number.isFinite(prc) || prc < 0))) {
+    return NextResponse.json({ error: 'مدت یا قیمت خدمت نامعتبر است' }, { status: 400 })
+  }
+  if (branchId) {
+    const b = await db.branch.findUnique({ where: { id: branchId as string } })
+    if (!b || b.tenantId !== session.tenantId) return NextResponse.json({ error: 'شعبه یافت نشد' }, { status: 404 })
+  }
   const service = await db.service.create({
     data: {
       tenantId: session.tenantId,
@@ -38,7 +47,7 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const body = await req.json().catch(() => ({}))
   const { id, name, description, duration, price, capacity, branchId, status } = body as Record<string, unknown>
@@ -46,6 +55,13 @@ export async function PATCH(req: Request) {
   const existing = await db.service.findUnique({ where: { id: id as string } })
   if (!existing || existing.tenantId !== session.tenantId) {
     return NextResponse.json({ error: 'خدمت یافت نشد' }, { status: 404 })
+  }
+  if ((duration !== undefined && (!Number.isFinite(Number(duration)) || Number(duration) < 5 || Number(duration) > 600)) || (price !== undefined && (!Number.isFinite(Number(price)) || Number(price) < 0))) {
+    return NextResponse.json({ error: 'مدت یا قیمت خدمت نامعتبر است' }, { status: 400 })
+  }
+  if (branchId) {
+    const b = await db.branch.findUnique({ where: { id: branchId as string } })
+    if (!b || b.tenantId !== session.tenantId) return NextResponse.json({ error: 'شعبه یافت نشد' }, { status: 404 })
   }
   const service = await db.service.update({
     where: { id: id as string },
@@ -66,7 +82,7 @@ export async function PATCH(req: Request) {
 }
 
 export async function DELETE(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const url = new URL(req.url)
   const id = url.searchParams.get('id')

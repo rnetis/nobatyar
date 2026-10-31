@@ -63,6 +63,17 @@ if (databaseUrl.url && databaseUrl.url !== process.env.DATABASE_URL) {
   console.log(`[start] DATABASE_URL -> ${databaseUrl.url}`)
 } else if (!databaseUrl.found) {
   console.warn(`[start] no SQLite file found for DATABASE_URL (${process.env.DATABASE_URL}) at or above ${projectRoot}`)
+} else if (!databaseUrl.url) {
+  // .env is gitignored, and this deploy host ships only non-ignored files — so
+  // the app starts with none of them. Say which ones are missing instead of
+  // letting every database route fail with a bare Prisma error.
+  const missing = ['DATABASE_URL', 'SESSION_SECRET'].filter((name) => !process.env[name])
+  if (missing.length) {
+    console.warn(
+      `[start] ${missing.join(' and ')} not set — .env is excluded from the deploy, so the`,
+    )
+    console.warn('[start]   host must provide these in its own environment (database routes and sign-in fail without them).')
+  }
 }
 
 const log = createWriteStream(path.join(projectRoot, 'server.log'), { flags: 'a' })

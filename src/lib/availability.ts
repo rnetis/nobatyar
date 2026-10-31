@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@prisma/client'
 import { dateKey, timeToMinutes, minutesToTime } from '@/lib/jalali'
 
 /**
@@ -42,23 +43,74 @@ export function parseHours(hoursJson: string): Record<string, DayHours> {
   }
 }
 
-export async function getAvailability(params: {
-  branchId: string
-  serviceId: string
-  staffId?: string | null
-  date: string // gregorian "2026-10-08"
-}): Promise<{ date: string; closed: boolean; slots: SlotInfo[]; openTime?: string; closeTime?: string }> {
-  const branch = await db.branch.findUnique({ where: { id: params.branchId } })
-  const service = await db.service.findUnique({ where: { id: params.serviceId } })
-  if (!branch || !service) return { date: params.date, closed: true, slots: [] }
+/** How far ahead customers may book (days). */
+export const MAX_ADVANCE_DAYS = 60
+
+type Client = Prisma.TransactionClient
+
+/** Parse "YYYY-MM-DD" into a real calendar date (rejects 2026-02-31 style rollovers). */
+export function parseGregorianKey(key: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key)
+  if (!m) return null
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const date = new Date(y, mo - 1, d, 12, 0, 0)
+  if (date.getFullYear() !== y || date.getMonth() !== mo - 1 || date.getDate() !== d) return null
+  return date
+}
+
+/** Can this staff member perform the service at the branch? */
+export async function staffCanServe(
+  client: Client,
+  args: { staffId: string; tenantId: string; branchId: string; serviceId: string },
+): Promise<boolean> {
+  const st = await client.staff.findUnique({ where: { id: args.staffId } })
+  if (!st || st.tenantId !== args.tenantId || st.status !== 'ACTIVE') return false
+  if (st.branchId && st.branchId !== args.branchId) return false
+  try {
+    const ids = JSON.parse(st.serviceIds || '[]')
+    return Array.isArray(ids) && ids.includes(args.serviceId)
+  } catch {
+    return false
+  }
+}
+
+export async function getAvailability(
+  params: {
+    branchId: string
+    serviceId: string
+    staffId?: string | null
+    date: string // gregorian "2026-10-08"
+    excludeAppointmentId?: string // ignore this booking (rescheduling)
+  },
+  client: Client = db,
+): Promise<{ date: string; closed: boolean; slots: SlotInfo[]; openTime?: string; closeTime?: string }> {
+  const closedResult = { date: params.date, closed: true, slots: [] as SlotInfo[] }
+  const d = parseGregorianKey(params.date)
+  if (!d) return closedResult
+
+  const [branch, service] = await Promise.all([
+    client.branch.findUnique({ where: { id: params.branchId } }),
+    client.service.findUnique({ where: { id: params.serviceId } }),
+  ])
+  if (!branch || !service) return closedResult
+  if (branch.status !== 'ACTIVE' || service.status !== 'ACTIVE') return closedResult
+  if (service.tenantId !== branch.tenantId) return closedResult
+  if (service.branchId && service.branchId !== branch.id) return closedResult
+  if (params.staffId) {
+    const ok = await staffCanServe(client, { staffId: params.staffId, tenantId: branch.tenantId, branchId: branch.id, serviceId: service.id })
+    if (!ok) return closedResult
+  }
+
+  // no booking in the past, none beyond the horizon
+  const now = new Date()
+  const todayKey = dateKey(now)
+  if (params.date < todayKey) return closedResult
+  const horizon = new Date(now.getFullYear(), now.getMonth(), now.getDate() + MAX_ADVANCE_DAYS)
+  if (d.getTime() > horizon.getTime()) return closedResult
 
   const hours = parseHours(branch.hours)
-  const d = new Date(params.date + 'T12:00:00')
   const dayHours = hours[DAY_KEYS[d.getDay()]] || defaultHours()[DAY_KEYS[d.getDay()]]
-
-  if (dayHours.closed) {
-    return { date: params.date, closed: true, slots: [] }
-  }
+  if (dayHours.closed) return closedResult
 
   const open = timeToMinutes(dayHours.open)
   const close = timeToMinutes(dayHours.close)
@@ -66,43 +118,54 @@ export async function getAvailability(params: {
 
   const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0)
   const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59)
-
-  const appts = await db.appointment.findMany({
+  // appointments that may overlap the day (a late one can spill past midnight; ignore, hours are same-day)
+  const appts = await client.appointment.findMany({
     where: {
       branchId: params.branchId,
-      serviceId: params.serviceId,
       scheduledAt: { gte: dayStart, lte: dayEnd },
       status: { notIn: ['CANCELLED', 'NO_SHOW'] },
-      ...(params.staffId ? { staffId: params.staffId } : {}),
+      ...(params.excludeAppointmentId ? { id: { not: params.excludeAppointmentId } } : {}),
     },
-    select: { scheduledAt: true },
+    select: { scheduledAt: true, durationMin: true, serviceId: true, staffId: true },
   })
 
-  const now = new Date()
-  const isToday = dateKey(now) === params.date
-
+  const isToday = todayKey === params.date
   const slots: SlotInfo[] = []
   for (let t = open; t + step <= close; t += step) {
-    const time = minutesToTime(t)
     const slotStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), Math.floor(t / 60), t % 60)
-    const count = appts.filter((a) => Math.abs(a.scheduledAt.getTime() - slotStart.getTime()) < 5 * 60 * 1000).length
-    const remaining = Math.max(0, service.capacity - count)
-    const inPast = isToday && slotStart.getTime() <= now.getTime()
-    slots.push({ time, available: remaining > 0 && !inPast, remaining })
+    const slotStartMs = slotStart.getTime()
+    const slotEndMs = slotStartMs + step * 60_000
+    const overlaps = (a: { scheduledAt: Date; durationMin: number }) => {
+      const aStart = a.scheduledAt.getTime()
+      return aStart < slotEndMs && aStart + a.durationMin * 60_000 > slotStartMs
+    }
+    // capacity is per service; a specific staff member can only do one thing at a time
+    const sameService = appts.filter((a) => a.serviceId === params.serviceId && overlaps(a)).length
+    let remaining = Math.max(0, service.capacity - sameService)
+    if (params.staffId) {
+      const staffBusy = appts.some((a) => a.staffId === params.staffId && overlaps(a))
+      if (staffBusy) remaining = 0
+    }
+    const inPast = isToday && slotStartMs <= now.getTime()
+    slots.push({ time: minutesToTime(t), available: remaining > 0 && !inPast, remaining })
   }
 
   return { date: params.date, closed: false, slots, openTime: dayHours.open, closeTime: dayHours.close }
 }
 
 /** Check a single slot is still bookable (used before creating booking). */
-export async function isSlotAvailable(params: {
-  branchId: string
-  serviceId: string
-  staffId?: string | null
-  date: string
-  time: string
-}): Promise<boolean> {
-  const day = await getAvailability(params)
+export async function isSlotAvailable(
+  params: {
+    branchId: string
+    serviceId: string
+    staffId?: string | null
+    date: string
+    time: string
+    excludeAppointmentId?: string
+  },
+  client: Client = db,
+): Promise<boolean> {
+  const day = await getAvailability(params, client)
   const slot = day.slots.find((s) => s.time === params.time)
   return !!slot && slot.available
 }

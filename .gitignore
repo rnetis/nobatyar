@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -51,4 +52,8 @@ prompt
 
 server.log
 # Skills directory
-/skills/
+/skills/tests/integration/client
+tests/integration/node_modules
+tests/integration/*.db
+tests/integration/ddl.sql
+tests/integration/tsconfig.json

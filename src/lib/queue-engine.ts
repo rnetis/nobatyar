@@ -1,205 +1,196 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@prisma/client'
 import { broadcast, broadcastQueueUpdate } from '@/lib/bus'
-import { queueNotification, buildTemplateVars } from '@/lib/sms'
-import { minutesToTime, dateKey } from '@/lib/jalali'
+import { queueNotification, buildTemplateVars, type NotificationType } from '@/lib/sms'
+import { dateKey } from '@/lib/jalali'
+import { generateUniqueCode } from '@/lib/booking-code'
 
 /**
  * Queue Engine (PRD §14–18, §57)
- * All mutations are atomic (serialized SQLite transaction) → AC-006
- * Every mutation: recalc positions → recalc ETA → audit → broadcast → notify
+ *
+ * Guarantees
+ *  - Every state mutation runs inside ONE interactive transaction. Prisma serialises
+ *    SQLite transactions on a single connection, so two operators pressing "next" at the
+ *    same moment can never call the same customer (AC-006).
+ *  - Side effects (SMS, webhooks, websocket broadcasts) run AFTER commit and never
+ *    inside the transaction (using `db` inside a tx would deadlock on SQLite).
+ *
+ * Ordering rule for WAITING entries
+ *  - A new entry is inserted by (priority desc, scheduled time asc) relative to the
+ *    current order. After that the stored `position` is authoritative, so a manual
+ *    "move" by an operator is never silently undone by a later recalculation.
  */
 
+type Tx = Prisma.TransactionClient
+const TX_OPTS = { maxWait: 15_000, timeout: 20_000 }
+
 export type QueueAction =
-  | 'next'        // complete current, call the next one
-  | 'call'        // call specific entry
+  | 'next'        // complete current (if in service), call the next eligible one
+  | 'call'        // call specific entry (operator override: ignores the early-call window)
   | 'recall'
   | 'serve'       // start service for called entry
   | 'complete'
   | 'skip'
   | 'cancel'
   | 'no_show'
-  | 'move'        // manual position change {entryId, direction: 'up'|'down'|'top'|'bottom'} or {entryId, position}
+  | 'requeue'     // put a skipped / no-show customer back at the end of the queue
+  | 'move'        // {entryId, direction: 'up'|'down'|'top'|'bottom'} or {entryId, position}
   | 'priority'    // {entryId, priority}
   | 'pause' | 'resume'
 
-export const PRIORITY_RANK: Record<string, number> = {
-  NORMAL: 0,
-  PRIORITY: 1,
-  VIP: 2,
-  EMERGENCY: 3,
+export const PRIORITY_RANK: Record<string, number> = { NORMAL: 0, PRIORITY: 1, VIP: 2, EMERGENCY: 3 }
+export const PRIORITY_FA: Record<string, string> = { NORMAL: 'عادی', PRIORITY: 'ویژه', VIP: 'VIP', EMERGENCY: 'فوری' }
+
+const rankOf = (p: string) => PRIORITY_RANK[p] ?? 0
+
+/** Entry states that still occupy the queue. */
+export const ACTIVE_ENTRY_STATES = ['WAITING', 'CALLED', 'IN_SERVICE']
+/** `next` only auto-calls customers whose slot is within this window (or who already arrived). */
+export const EARLY_CALL_MINUTES = 30
+
+// ───────────────────────── ETA ─────────────────────────
+// The engine serves one customer at a time per queue, so ETA is simply
+// (people ahead × average service time) plus half an average slot if someone is being served now.
+export function estimateWait(peopleAhead: number, avgServiceMin: number, busy: boolean): number {
+  const avg = Math.max(1, avgServiceMin)
+  return peopleAhead * avg + (busy ? Math.round(avg / 2) : 0)
 }
 
-export const PRIORITY_FA: Record<string, string> = {
-  NORMAL: 'عادی',
-  PRIORITY: 'ویژه',
-  VIP: 'VIP',
-  EMERGENCY: 'فوری',
+/** Has the customer arrived (walk-in / checked-in) or is their slot close enough to be called? */
+export function isEligibleForAutoCall(
+  e: { appointment: { status: string; scheduledAt: Date } },
+  now: Date,
+): boolean {
+  if (e.appointment.status === 'WAITING') return true
+  return e.appointment.scheduledAt.getTime() <= now.getTime() + EARLY_CALL_MINUTES * 60_000
 }
 
-export async function getOrCreateQueue(branchId: string, serviceId: string, date: string) {
-  const existing = await db.queue.findUnique({
-    where: { branchId_serviceId_date: { branchId, serviceId, date } },
-  })
+// ───────────────────────── queue / entry primitives ─────────────────────────
+export async function getOrCreateQueue(client: Tx, branchId: string, serviceId: string, date: string) {
+  const key = { branchId_serviceId_date: { branchId, serviceId, date } }
+  const existing = await client.queue.findUnique({ where: key })
   if (existing) return existing
-  const branch = await db.branch.findUnique({ where: { id: branchId } })
+  const branch = await client.branch.findUnique({ where: { id: branchId } })
   if (!branch) throw new Error('branch not found')
-  return db.queue.create({
-    data: { tenantId: branch.tenantId, branchId, serviceId, date, status: 'OPEN' },
-  })
+  try {
+    return await client.queue.create({ data: { tenantId: branch.tenantId, branchId, serviceId, date, status: 'OPEN' } })
+  } catch (e) {
+    const again = await client.queue.findUnique({ where: key })
+    if (again) return again
+    throw e
+  }
 }
 
-/** Append an appointment to the end of today's queue. */
-export async function enqueueAppointment(appointmentId: string): Promise<void> {
-  const appt = await db.appointment.findUnique({ where: { id: appointmentId } })
-  if (!appt) return
-  const date = dateKey(appt.scheduledAt)
-  const queue = await getOrCreateQueue(appt.branchId, appt.serviceId, date)
-  const last = await db.queueEntry.findFirst({
-    where: { queueId: queue.id },
-    orderBy: { position: 'desc' },
-  })
-  await db.queueEntry.create({
-    data: {
-      queueId: queue.id,
-      appointmentId,
-      position: (last?.position ?? 0) + 1,
-      status: 'WAITING',
-      priority: appt.priority,
-    },
-  })
-  await recalculate(queue.id)
-}
-
-/** Recalculate WAITING positions by (priority desc, position asc, joinedAt asc) → reindex 1..n */
-export async function recalculate(queueId: string): Promise<void> {
-  const entries = await db.queueEntry.findMany({
+/** Re-index WAITING entries to 1..n, preserving their current order. */
+export async function recalculate(client: Tx, queueId: string): Promise<void> {
+  const waiting = await client.queueEntry.findMany({
     where: { queueId, status: 'WAITING' },
-    orderBy: [{ joinedAt: 'asc' }],
+    orderBy: [{ position: 'asc' }, { joinedAt: 'asc' }],
   })
-  const sorted = [...entries].sort((a, b) => {
-    const pr = (PRIORITY_RANK[b.priority] ?? 0) - (PRIORITY_RANK[a.priority] ?? 0)
-    if (pr !== 0) return pr
-    if (a.position !== b.position) return a.position - b.position
-    return a.joinedAt.getTime() - b.joinedAt.getTime()
-  })
-  for (let i = 0; i < sorted.length; i++) {
-    if (sorted[i].position !== i + 1) {
-      await db.queueEntry.update({ where: { id: sorted[i].id }, data: { position: i + 1 } })
-      sorted[i].position = i + 1
+  for (let i = 0; i < waiting.length; i++) {
+    if (waiting[i].position !== i + 1) {
+      await client.queueEntry.update({ where: { id: waiting[i].id }, data: { position: i + 1 } })
     }
   }
 }
 
-export async function activeStaffCount(branchId: string, serviceId: string): Promise<number> {
-  const staffList = await db.staff.findMany({
-    where: { tenantId: (await db.branch.findUnique({ where: { id: branchId } }))?.tenantId, status: 'ACTIVE' },
+/** Insert `entryId` into the WAITING order of its queue. */
+async function placeEntry(
+  client: Tx,
+  queueId: string,
+  entryId: string,
+  priority: string,
+  scheduledAt: Date,
+  atEnd: boolean,
+): Promise<void> {
+  const waiting = await client.queueEntry.findMany({
+    where: { queueId, status: 'WAITING', id: { not: entryId } },
+    include: { appointment: { select: { scheduledAt: true } } },
+    orderBy: [{ position: 'asc' }, { joinedAt: 'asc' }],
   })
-  let count = 0
-  for (const s of staffList) {
-    if (s.branchId && s.branchId !== branchId) continue
-    try {
-      const ids = JSON.parse(s.serviceIds || '[]')
-      if (Array.isArray(ids) && ids.includes(serviceId)) count++
-    } catch { /* noop */ }
+  let idx = waiting.length
+  if (!atEnd) {
+    const r = rankOf(priority)
+    while (idx > 0) {
+      const prev = waiting[idx - 1]
+      const pr = rankOf(prev.priority)
+      const prevComesAfterNew = pr < r || (pr === r && prev.appointment.scheduledAt.getTime() > scheduledAt.getTime())
+      if (!prevComesAfterNew) break
+      idx--
+    }
   }
-  return Math.max(1, Math.min(count || 1, 4))
+  const ids = waiting.map((w) => w.id)
+  ids.splice(idx, 0, entryId)
+  const current = new Map(waiting.map((w) => [w.id, w.position]))
+  for (let i = 0; i < ids.length; i++) {
+    if (ids[i] === entryId || current.get(ids[i]) !== i + 1) {
+      await client.queueEntry.update({ where: { id: ids[i] }, data: { position: i + 1 } })
+    }
+  }
 }
 
+async function enqueueInner(client: Tx, appointmentId: string, opts: { atEnd?: boolean; reposition?: boolean }): Promise<{ queueId: string } | null> {
+  const appt = await client.appointment.findUnique({ where: { id: appointmentId } })
+  if (!appt) return null
+  const queue = await getOrCreateQueue(client, appt.branchId, appt.serviceId, dateKey(appt.scheduledAt))
+  const existing = await client.queueEntry.findUnique({ where: { appointmentId } })
+
+  // idempotent: already waiting in the right queue (booking route + check-in both call this)
+  if (existing && existing.queueId === queue.id && existing.status === 'WAITING' && !opts.reposition) return { queueId: queue.id }
+
+  const oldQueueId = existing && existing.queueId !== queue.id ? existing.queueId : null
+  const entry = existing
+    ? await client.queueEntry.update({
+        where: { id: existing.id },
+        data: {
+          queueId: queue.id, status: 'WAITING', priority: appt.priority, joinedAt: new Date(),
+          calledAt: null, startedAt: null, completedAt: null,
+        },
+      })
+    : await client.queueEntry.create({
+        data: { queueId: queue.id, appointmentId, position: 0, status: 'WAITING', priority: appt.priority },
+      })
+  await placeEntry(client, queue.id, entry.id, appt.priority, appt.scheduledAt, !!opts.atEnd)
+  await recalculate(client, queue.id)
+  if (oldQueueId) await recalculate(client, oldQueueId)
+  return { queueId: queue.id }
+}
+
+/**
+ * Put an appointment into its day-queue. Safe to call repeatedly:
+ * the old implementation threw a unique-constraint error on check-in and reschedule
+ * because every online booking already had a queue entry.
+ */
+export async function enqueueAppointment(
+  appointmentId: string,
+  opts: { atEnd?: boolean; reposition?: boolean } = {},
+  client?: Tx,
+): Promise<{ queueId: string } | null> {
+  if (client) return enqueueInner(client, appointmentId, opts)
+  return db.$transaction((tx) => enqueueInner(tx, appointmentId, opts), TX_OPTS)
+}
+
+// ───────────────────────── read models ─────────────────────────
 export async function calcEta(queueId: string, entry?: { id: string } | null): Promise<{ peopleAhead: number; estimatedWait: number }> {
   const queue = await db.queue.findUnique({ where: { id: queueId } })
   if (!queue) return { peopleAhead: 0, estimatedWait: 0 }
-  const waiting = await db.queueEntry.findMany({
-    where: { queueId, status: 'WAITING' },
-    orderBy: { position: 'asc' },
-  })
-  const staffN = await activeStaffCount(queue.branchId, queue.serviceId)
-  const perPerson = Math.max(5, Math.round(queue.avgServiceMin / staffN))
-  if (!entry) {
-    return { peopleAhead: waiting.length, estimatedWait: waiting.length * perPerson }
-  }
+  const [waiting, busyCount] = await Promise.all([
+    db.queueEntry.findMany({ where: { queueId, status: 'WAITING' }, orderBy: { position: 'asc' } }),
+    db.queueEntry.count({ where: { queueId, status: { in: ['CALLED', 'IN_SERVICE'] } } }),
+  ])
+  const busy = busyCount > 0
+  if (!entry) return { peopleAhead: waiting.length, estimatedWait: estimateWait(waiting.length, queue.avgServiceMin, busy) }
   const me = waiting.find((w) => w.id === entry.id)
   if (!me) return { peopleAhead: 0, estimatedWait: 0 }
   const peopleAhead = waiting.filter((w) => w.position < me.position).length
-  return { peopleAhead, estimatedWait: peopleAhead * perPerson }
-}
-
-async function audit(args: {
-  tenantId: string
-  actor: string
-  action: string
-  entityType: string
-  entityId?: string
-  detail?: Record<string, unknown>
-}) {
-  await db.auditLog.create({
-    data: {
-      tenantId: args.tenantId,
-      actor: args.actor,
-      action: args.action,
-      entityType: args.entityType,
-      entityId: args.entityId || null,
-      detail: args.detail ? JSON.stringify(args.detail) : null,
-    },
-  })
-}
-
-async function loadTenantContext(tenantId: string) {
-  return db.tenant.findUnique({ where: { id: tenantId } })
-}
-
-/** Notify the closest waiting bookers that their turn is near / positions moved (threshold policy). */
-async function notifyWaiting(queueId: string, tenantId: string, maxNotify = 2) {
-  const queue = await db.queue.findUnique({
-    where: { id: queueId },
-    include: { branch: true, service: true },
-  })
-  if (!queue) return
-  const tenant = await loadTenantContext(tenantId)
-  if (!tenant) return
-  const waiting = await db.queueEntry.findMany({
-    where: { queueId, status: 'WAITING' },
-    orderBy: { position: 'asc' },
-    include: { appointment: { include: { customer: true } } },
-  })
-  const staffN = await activeStaffCount(queue.branchId, queue.serviceId)
-  const perPerson = Math.max(5, Math.round(queue.avgServiceMin / staffN))
-  for (const w of waiting.slice(0, maxNotify)) {
-    const peopleAhead = waiting.filter((x) => x.position < w.position).length
-    const vars = buildTemplateVars({
-      customerName: w.appointment.customer.name,
-      businessName: tenant.name,
-      branchName: queue.branch.name,
-      serviceName: queue.service.name,
-      appointmentCode: w.appointment.code,
-      scheduledAt: w.appointment.scheduledAt,
-      liveToken: w.appointment.liveToken,
-      queue: { position: w.position, peopleAhead, estimatedWait: peopleAhead * perPerson },
-    })
-    await queueNotification({
-      tenantId,
-      appointmentId: w.appointmentId,
-      type: 'QUEUE_CHANGED',
-      recipient: w.appointment.customer.mobile,
-      vars,
-      material: true,
-    })
-  }
-}
-
-async function snapshotPayload(queueId: string) {
-  const state = await getLiveState(queueId)
-  return state
+  return { peopleAhead, estimatedWait: estimateWait(peopleAhead, queue.avgServiceMin, busy) }
 }
 
 /** Full live-state snapshot for a queue (booker + business views). */
 export async function getLiveState(queueId: string) {
   const queue = await db.queue.findUnique({
     where: { id: queueId },
-    include: {
-      branch: true,
-      service: true,
-      tenant: { select: { id: true, name: true, logoText: true } },
-    },
+    include: { branch: true, service: true, tenant: { select: { id: true, name: true, logoText: true } } },
   })
   if (!queue) return null
   const entries = await db.queueEntry.findMany({
@@ -208,8 +199,7 @@ export async function getLiveState(queueId: string) {
     orderBy: { position: 'asc' },
   })
   const waiting = entries.filter((e) => e.status === 'WAITING')
-  const staffN = await activeStaffCount(queue.branchId, queue.serviceId)
-  const perPerson = Math.max(5, Math.round(queue.avgServiceMin / staffN))
+  const busy = entries.some((e) => e.status === 'CALLED' || e.status === 'IN_SERVICE')
   return {
     queue: {
       id: queue.id,
@@ -238,23 +228,23 @@ export async function getLiveState(queueId: string) {
         customerName: e.appointment.customer.name,
         calledAt: e.calledAt,
       })),
-    waiting: waiting.map((e) => {
-      const peopleAhead = waiting.filter((x) => x.position < e.position).length
-      return {
-        id: e.id,
-        code: e.appointment.code,
-        position: e.position,
-        peopleAhead,
-        estimatedWait: peopleAhead * perPerson,
-        priority: e.priority,
-        status: e.status,
-        token: e.appointment.liveToken,
-        customerName: e.appointment.customer.name,
-        joinedAt: e.joinedAt,
-      }
-    }),
+    waiting: waiting.map((e, i) => ({
+      id: e.id,
+      code: e.appointment.code,
+      position: e.position,
+      peopleAhead: i,
+      estimatedWait: estimateWait(i, queue.avgServiceMin, busy),
+      priority: e.priority,
+      status: e.status,
+      token: e.appointment.liveToken,
+      customerName: e.appointment.customer.name,
+      joinedAt: e.joinedAt,
+      scheduledAt: e.appointment.scheduledAt,
+      arrived: e.appointment.status === 'WAITING',
+    })),
     recent: entries
       .filter((e) => ['COMPLETED', 'SKIPPED', 'CANCELLED', 'NO_SHOW'].includes(e.status))
+      .sort((a, b) => (a.completedAt?.getTime() ?? 0) - (b.completedAt?.getTime() ?? 0))
       .slice(-6)
       .reverse()
       .map((e) => ({
@@ -269,11 +259,18 @@ export async function getLiveState(queueId: string) {
 
 export type QueueSnapshot = NonNullable<Awaited<ReturnType<typeof getLiveState>>>
 
-/**
- * Execute a queue action atomically.
- * SQLite serializes writes per-connection → concurrent "next" calls are safe (AC-006).
- */
-export async function executeQueueAction(args: {
+// ───────────────────────── actions ─────────────────────────
+interface NotifyJob {
+  appointmentId: string
+  type: NotificationType
+  customerName: string
+  mobile: string
+  code: string
+  scheduledAt: Date
+  liveToken: string
+}
+
+type ActionArgs = {
   queueId: string
   action: QueueAction
   actor: string
@@ -282,286 +279,366 @@ export async function executeQueueAction(args: {
   position?: number
   direction?: 'up' | 'down' | 'top' | 'bottom'
   reason?: string
-}): Promise<{ ok: boolean; error?: string; snapshot?: QueueSnapshot }> {
-  const queue = await db.queue.findUnique({ where: { id: args.queueId } })
+  /** set by customer-initiated flows where a "reason" makes no sense */
+  bypassReason?: boolean
+}
+
+type ActionOutcome =
+  | { ok: false; error: string }
+  | { ok: true; jobs: NotifyJob[]; tenantId: string; tenantName: string; branchName: string; serviceName: string; sendCancelSms: boolean; targetEntryId?: string; callEvent: boolean }
+
+const REASON_ACTIONS: QueueAction[] = ['skip', 'cancel', 'no_show', 'move']
+
+async function runAction(tx: Tx, args: ActionArgs): Promise<ActionOutcome> {
+  const queue = await tx.queue.findUnique({ where: { id: args.queueId }, include: { branch: true, service: true } })
   if (!queue) return { ok: false, error: 'صف یافت نشد' }
-  const tenant = await loadTenantContext(queue.tenantId)
+  const tenant = await tx.tenant.findUnique({ where: { id: queue.tenantId } })
   if (!tenant) return { ok: false, error: 'مستأجر یافت نشد' }
 
-  const entries = await db.queueEntry.findMany({
+  if (tenant.reasonRequired && !args.bypassReason && REASON_ACTIONS.includes(args.action) && !args.reason?.trim()) {
+    return { ok: false, error: 'ثبت دلیل برای این عملیات الزامی است' }
+  }
+
+  const entries = await tx.queueEntry.findMany({
     where: { queueId: queue.id },
     include: { appointment: { include: { customer: true } } },
-    orderBy: { position: 'asc' },
+    orderBy: [{ position: 'asc' }, { joinedAt: 'asc' }],
   })
+  type Entry = (typeof entries)[number]
   const waiting = entries.filter((e) => e.status === 'WAITING')
   const serving = entries.find((e) => e.status === 'CALLED' || e.status === 'IN_SERVICE')
   const now = new Date()
+  const jobs: NotifyJob[] = []
+  let sendCancelSms = true
+  try { sendCancelSms = JSON.parse(tenant.cancelPolicy || '{}').sendCancelSms !== false } catch { /* default */ }
 
-  const notifyFor = async (entryId: string, type: Parameters<typeof queueNotification>[0]['type']) => {
-    const e = entries.find((x) => x.id === entryId)
-    if (!e) return
-    const vars = buildTemplateVars({
-      customerName: e.appointment.customer.name,
-      businessName: tenant.name,
-      branchName: queue.branchId ? (await db.branch.findUnique({ where: { id: queue.branchId } }))?.name : '',
-      serviceName: (await db.service.findUnique({ where: { id: queue.serviceId } }))?.name || '',
-      appointmentCode: e.appointment.code,
-      scheduledAt: e.appointment.scheduledAt,
-      liveToken: e.appointment.liveToken,
-      queue: null,
+  const job = (e: Entry, type: NotificationType) =>
+    jobs.push({
+      appointmentId: e.appointmentId, type, customerName: e.appointment.customer.name, mobile: e.appointment.customer.mobile,
+      code: e.appointment.code, scheduledAt: e.appointment.scheduledAt, liveToken: e.appointment.liveToken,
     })
-    await queueNotification({
-      tenantId: tenant.id,
-      appointmentId: e.appointmentId,
-      type,
-      recipient: e.appointment.customer.mobile,
-      vars,
-      material: true,
+  const audit = (action: string, entityType: string, entityId: string, detail?: Record<string, unknown>) =>
+    tx.auditLog.create({
+      data: { tenantId: tenant.id, actor: args.actor, action, entityType, entityId, detail: detail ? JSON.stringify(detail) : null },
     })
+  const findTarget = (): Entry | undefined => (args.entryId ? entries.find((e) => e.id === args.entryId) : serving)
+
+  const completeServing = async (e: Entry) => {
+    const data: Prisma.QueueUpdateInput = { currentServing: null }
+    if (e.startedAt) {
+      // learn the average service time (exponential moving average)
+      const mins = Math.max(3, Math.round((now.getTime() - e.startedAt.getTime()) / 60000))
+      data.avgServiceMin = Math.min(90, Math.round(queue.avgServiceMin * 0.7 + mins * 0.3))
+    }
+    await tx.queueEntry.update({ where: { id: e.id }, data: { status: 'COMPLETED', completedAt: now } })
+    await tx.appointment.update({ where: { id: e.appointmentId }, data: { status: 'COMPLETED' } })
+    await tx.queue.update({ where: { id: queue.id }, data })
+    await audit('QUEUE_COMPLETE', 'QueueEntry', e.id, { code: e.appointment.code })
   }
+  const callEntry = async (e: Entry, auditAction: string) => {
+    await tx.queueEntry.update({ where: { id: e.id }, data: { status: 'CALLED', calledAt: now } })
+    await tx.appointment.update({ where: { id: e.appointmentId }, data: { status: 'CALLED' } })
+    await tx.queue.update({ where: { id: queue.id }, data: { currentServing: e.appointment.code } })
+    job(e, 'CALLED')
+    await audit(auditAction, 'QueueEntry', e.id, { code: e.appointment.code })
+  }
+  const clearServingIfTarget = async (e: Entry) => {
+    if (serving && serving.id === e.id) await tx.queue.update({ where: { id: queue.id }, data: { currentServing: null } })
+  }
+
+  let targetEntryId: string | undefined
+  let callEvent = false
 
   switch (args.action) {
     case 'next': {
-      if (serving && serving.status === 'IN_SERVICE') {
-        // auto-complete current in-service then continue below
-        await db.queueEntry.update({
-          where: { id: serving.id },
-          data: { status: 'COMPLETED', completedAt: now },
-        })
-        await db.appointment.update({ where: { id: serving.appointmentId }, data: { status: 'COMPLETED' } })
-      } else if (serving && serving.status === 'CALLED') {
-        return { ok: false, error: 'ابتدا سرویس نفر فراخوانده‌شده را آغاز یا رد کنید' }
+      if (queue.status === 'PAUSED') return { ok: false, error: 'صف متوقف است؛ ابتدا آن را از سر بگیرید' }
+      if (serving?.status === 'CALLED') return { ok: false, error: 'ابتدا سرویس نفر فراخوانده‌شده را آغاز یا رد کنید' }
+      const next = waiting.find((e) => isEligibleForAutoCall(e, now))
+      if (!next && !serving) {
+        if (waiting.length === 0) break
+        return { ok: false, error: 'هنوز زمان نوبت نفر بعدی نرسیده است. برای فراخوانی زودتر، او را به‌صورت دستی فراخوانی کنید.' }
       }
-      const next = waiting.sort((a, b) => a.position - b.position)[0]
-      if (!next) {
-        await db.queue.update({ where: { id: queue.id }, data: { currentServing: null } })
-        break
-      }
-      await db.queueEntry.update({
-        where: { id: next.id },
-        data: { status: 'CALLED', calledAt: now },
-      })
-      await db.appointment.update({ where: { id: next.appointmentId }, data: { status: 'CALLED' } })
-      await db.queue.update({ where: { id: queue.id }, data: { currentServing: next.appointment.code } })
-      await notifyFor(next.id, 'CALLED')
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_CALL_NEXT',
-        entityType: 'QueueEntry', entityId: next.id,
-        detail: { code: next.appointment.code },
-      })
+      if (serving) await completeServing(serving) // IN_SERVICE here
+      if (next) { await callEntry(next, 'QUEUE_CALL_NEXT'); targetEntryId = next.id; callEvent = true }
       break
     }
     case 'call': {
+      if (queue.status === 'PAUSED') return { ok: false, error: 'صف متوقف است؛ ابتدا آن را از سر بگیرید' }
       const target = entries.find((e) => e.id === args.entryId)
       if (!target) return { ok: false, error: 'نوبت یافت نشد' }
       if (target.status !== 'WAITING') return { ok: false, error: 'این نوبت در انتظار نیست' }
-      if (serving && serving.status === 'IN_SERVICE') {
-        await db.queueEntry.update({
-          where: { id: serving.id },
-          data: { status: 'COMPLETED', completedAt: now },
-        })
-        await db.appointment.update({ where: { id: serving.appointmentId }, data: { status: 'COMPLETED' } })
-      }
-      await db.queueEntry.update({ where: { id: target.id }, data: { status: 'CALLED', calledAt: now } })
-      await db.appointment.update({ where: { id: target.appointmentId }, data: { status: 'CALLED' } })
-      await db.queue.update({ where: { id: queue.id }, data: { currentServing: target.appointment.code } })
-      await notifyFor(target.id, 'CALLED')
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_CALL',
-        entityType: 'QueueEntry', entityId: target.id, detail: { code: target.appointment.code },
-      })
+      if (serving?.status === 'CALLED') return { ok: false, error: 'ابتدا سرویس نفر فراخوانده‌شده را آغاز یا رد کنید' }
+      if (serving) await completeServing(serving)
+      await callEntry(target, 'QUEUE_CALL')
+      targetEntryId = target.id; callEvent = true
       break
     }
     case 'recall': {
-      if (!serving) return { ok: false, error: 'نوبت فراخوانده‌شده‌ای وجود ندارد' }
-      await notifyFor(serving.id, 'CALLED')
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_RECALL',
-        entityType: 'QueueEntry', entityId: serving.id, detail: { code: serving.appointment.code },
-      })
+      if (!serving || serving.status !== 'CALLED') return { ok: false, error: 'نوبت فراخوانده‌شده‌ای وجود ندارد' }
+      job(serving, 'CALLED')
+      await audit('QUEUE_RECALL', 'QueueEntry', serving.id, { code: serving.appointment.code })
+      targetEntryId = serving.id; callEvent = true
       break
     }
     case 'serve': {
       if (!serving || serving.status !== 'CALLED') return { ok: false, error: 'ابتدا نفر بعدی را فراخوانی کنید' }
-      await db.queueEntry.update({ where: { id: serving.id }, data: { status: 'IN_SERVICE', startedAt: now } })
-      await db.appointment.update({ where: { id: serving.appointmentId }, data: { status: 'IN_SERVICE' } })
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_START_SERVICE',
-        entityType: 'QueueEntry', entityId: serving.id, detail: { code: serving.appointment.code },
-      })
+      await tx.queueEntry.update({ where: { id: serving.id }, data: { status: 'IN_SERVICE', startedAt: now } })
+      await tx.appointment.update({ where: { id: serving.appointmentId }, data: { status: 'IN_SERVICE' } })
+      await audit('QUEUE_START_SERVICE', 'QueueEntry', serving.id, { code: serving.appointment.code })
+      targetEntryId = serving.id
       break
     }
     case 'complete': {
       if (!serving) return { ok: false, error: 'نوبتی در حال سرویس نیست' }
-      await db.queueEntry.update({ where: { id: serving.id }, data: { status: 'COMPLETED', completedAt: now } })
-      await db.appointment.update({ where: { id: serving.appointmentId }, data: { status: 'COMPLETED' } })
-      await db.queue.update({ where: { id: queue.id }, data: { currentServing: null } })
-      // learn average service time
-      if (serving.startedAt) {
-        const mins = Math.max(3, Math.round((now.getTime() - serving.startedAt.getTime()) / 60000))
-        const newAvg = Math.round(queue.avgServiceMin * 0.7 + mins * 0.3)
-        await db.queue.update({ where: { id: queue.id }, data: { avgServiceMin: Math.min(90, newAvg) } })
-      }
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_COMPLETE',
-        entityType: 'QueueEntry', entityId: serving.id, detail: { code: serving.appointment.code },
-      })
+      await completeServing(serving)
+      targetEntryId = serving.id
       break
     }
-    case 'skip': {
-      const target = args.entryId ? entries.find((e) => e.id === args.entryId) : serving
+    case 'skip':
+    case 'no_show': {
+      const target = findTarget()
       if (!target) return { ok: false, error: 'نوبت یافت نشد' }
-      await db.queueEntry.update({ where: { id: target.id }, data: { status: 'SKIPPED' } })
-      await db.appointment.update({ where: { id: target.appointmentId }, data: { status: 'SKIPPED' } })
-      if (serving && serving.id === target.id) {
-        await db.queue.update({ where: { id: queue.id }, data: { currentServing: null } })
-      }
-      await notifyFor(target.id, 'QUEUE_CHANGED')
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_SKIP',
-        entityType: 'QueueEntry', entityId: target.id, detail: { code: target.appointment.code, reason: args.reason || null },
-      })
+      if (target.status !== 'WAITING' && target.status !== 'CALLED') return { ok: false, error: 'این نوبت دیگر فعال نیست' }
+      const isSkip = args.action === 'skip'
+      const status = isSkip ? 'SKIPPED' : 'NO_SHOW'
+      await tx.queueEntry.update({ where: { id: target.id }, data: { status, completedAt: now } })
+      await tx.appointment.update({ where: { id: target.appointmentId }, data: { status } })
+      await clearServingIfTarget(target)
+      if (!isSkip) job(target, 'NO_SHOW') // a skip sends no SMS: the old one rendered an empty "new position" message
+      await audit(isSkip ? 'QUEUE_SKIP' : 'QUEUE_NO_SHOW', 'QueueEntry', target.id, { code: target.appointment.code, reason: args.reason || null })
+      targetEntryId = target.id
       break
     }
     case 'cancel': {
-      const target = args.entryId ? entries.find((e) => e.id === args.entryId) : serving
+      const target = findTarget()
       if (!target) return { ok: false, error: 'نوبت یافت نشد' }
-      await db.queueEntry.update({ where: { id: target.id }, data: { status: 'CANCELLED' } })
-      await db.appointment.update({ where: { id: target.appointmentId }, data: { status: 'CANCELLED' } })
-      if (serving && serving.id === target.id) {
-        await db.queue.update({ where: { id: queue.id }, data: { currentServing: null } })
-      }
-      await notifyFor(target.id, 'CANCELLED')
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_CANCEL',
-        entityType: 'QueueEntry', entityId: target.id, detail: { code: target.appointment.code, reason: args.reason || null },
-      })
+      if (![...ACTIVE_ENTRY_STATES, 'SKIPPED'].includes(target.status)) return { ok: false, error: 'این نوبت دیگر قابل لغو نیست' }
+      await tx.queueEntry.update({ where: { id: target.id }, data: { status: 'CANCELLED', completedAt: now } })
+      await tx.appointment.update({ where: { id: target.appointmentId }, data: { status: 'CANCELLED' } })
+      await clearServingIfTarget(target)
+      job(target, 'CANCELLED')
+      await audit('QUEUE_CANCEL', 'QueueEntry', target.id, { code: target.appointment.code, reason: args.reason || null })
+      targetEntryId = target.id
       break
     }
-    case 'no_show': {
-      const target = args.entryId ? entries.find((e) => e.id === args.entryId) : serving
+    case 'requeue': {
+      const target = entries.find((e) => e.id === args.entryId)
       if (!target) return { ok: false, error: 'نوبت یافت نشد' }
-      await db.queueEntry.update({ where: { id: target.id }, data: { status: 'NO_SHOW' } })
-      await db.appointment.update({ where: { id: target.appointmentId }, data: { status: 'NO_SHOW' } })
-      if (serving && serving.id === target.id) {
-        await db.queue.update({ where: { id: queue.id }, data: { currentServing: null } })
-      }
-      await notifyFor(target.id, 'NO_SHOW')
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_NO_SHOW',
-        entityType: 'QueueEntry', entityId: target.id, detail: { code: target.appointment.code },
+      if (target.status !== 'SKIPPED' && target.status !== 'NO_SHOW') return { ok: false, error: 'فقط نوبت ردشده یا غایب را می‌توان به صف بازگرداند' }
+      await tx.queueEntry.update({
+        where: { id: target.id },
+        data: { status: 'WAITING', joinedAt: now, calledAt: null, startedAt: null, completedAt: null },
       })
+      await tx.appointment.update({ where: { id: target.appointmentId }, data: { status: 'WAITING' } })
+      await placeEntry(tx, queue.id, target.id, target.priority, target.appointment.scheduledAt, true)
+      await audit('QUEUE_REQUEUE', 'QueueEntry', target.id, { code: target.appointment.code })
+      targetEntryId = target.id
       break
     }
     case 'move': {
       if (!args.entryId) return { ok: false, error: 'نوبت مشخص نیست' }
       const target = waiting.find((e) => e.id === args.entryId)
       if (!target) return { ok: false, error: 'نوبت در وضعیت انتظار نیست' }
-      const ordered = [...waiting].sort((a, b) => {
-        const pr = (PRIORITY_RANK[b.priority] ?? 0) - (PRIORITY_RANK[a.priority] ?? 0)
-        if (pr !== 0) return pr
-        return a.position - b.position
-      })
+      const ordered = [...waiting]
       const idx = ordered.findIndex((e) => e.id === target.id)
       let newIdx = idx
       if (args.direction === 'up') newIdx = Math.max(0, idx - 1)
       else if (args.direction === 'down') newIdx = Math.min(ordered.length - 1, idx + 1)
       else if (args.direction === 'top') newIdx = 0
       else if (args.direction === 'bottom') newIdx = ordered.length - 1
-      else if (typeof args.position === 'number') newIdx = Math.max(0, Math.min(ordered.length - 1, args.position - 1))
+      else if (typeof args.position === 'number' && Number.isFinite(args.position)) newIdx = Math.max(0, Math.min(ordered.length - 1, Math.floor(args.position) - 1))
       if (newIdx !== idx) {
         ordered.splice(newIdx, 0, ordered.splice(idx, 1)[0])
         for (let i = 0; i < ordered.length; i++) {
-          await db.queueEntry.update({ where: { id: ordered[i].id }, data: { position: i + 1 } })
+          if (ordered[i].position !== i + 1) await tx.queueEntry.update({ where: { id: ordered[i].id }, data: { position: i + 1 } })
         }
-        await audit({
-          tenantId: tenant.id, actor: args.actor, action: 'QUEUE_MOVE',
-          entityType: 'QueueEntry', entityId: target.id,
-          detail: { code: target.appointment.code, from: idx + 1, to: newIdx + 1, reason: args.reason || null },
-        })
+        await audit('QUEUE_MOVE', 'QueueEntry', target.id, { code: target.appointment.code, from: idx + 1, to: newIdx + 1, reason: args.reason || null })
       }
+      targetEntryId = target.id
       break
     }
     case 'priority': {
       const target = entries.find((e) => e.id === args.entryId)
       if (!target) return { ok: false, error: 'نوبت یافت نشد' }
-      const pr = args.priority && args.priority in PRIORITY_RANK ? args.priority : 'NORMAL'
-      await db.queueEntry.update({ where: { id: target.id }, data: { priority: pr } })
-      await db.appointment.update({ where: { id: target.appointmentId }, data: { priority: pr } })
-      await audit({
-        tenantId: tenant.id, actor: args.actor, action: 'QUEUE_PRIORITY',
-        entityType: 'QueueEntry', entityId: target.id, detail: { code: target.appointment.code, priority: pr },
-      })
+      if (target.status !== 'WAITING') return { ok: false, error: 'اولویت فقط برای نوبت‌های در انتظار قابل تغییر است' }
+      if (!args.priority || !(args.priority in PRIORITY_RANK)) return { ok: false, error: 'اولویت نامعتبر است' }
+      await tx.queueEntry.update({ where: { id: target.id }, data: { priority: args.priority } })
+      await tx.appointment.update({ where: { id: target.appointmentId }, data: { priority: args.priority } })
+      // a priority change must actually move the customer in the queue
+      await placeEntry(tx, queue.id, target.id, args.priority, target.appointment.scheduledAt, false)
+      await audit('QUEUE_PRIORITY', 'QueueEntry', target.id, { code: target.appointment.code, priority: args.priority })
+      targetEntryId = target.id
       break
     }
     case 'pause': {
-      await db.queue.update({ where: { id: queue.id }, data: { status: 'PAUSED' } })
-      await audit({ tenantId: tenant.id, actor: args.actor, action: 'QUEUE_PAUSE', entityType: 'Queue', entityId: queue.id })
+      await tx.queue.update({ where: { id: queue.id }, data: { status: 'PAUSED' } })
+      await audit('QUEUE_PAUSE', 'Queue', queue.id)
       break
     }
     case 'resume': {
-      await db.queue.update({ where: { id: queue.id }, data: { status: 'OPEN' } })
-      await audit({ tenantId: tenant.id, actor: args.actor, action: 'QUEUE_RESUME', entityType: 'Queue', entityId: queue.id })
+      await tx.queue.update({ where: { id: queue.id }, data: { status: 'OPEN' } })
+      await audit('QUEUE_RESUME', 'Queue', queue.id)
       break
     }
     default:
       return { ok: false, error: 'عملیات نامعتبر' }
   }
 
-  await recalculate(queue.id)
-  const snapshot = await snapshotPayload(queue.id)
-
-  // Broadcast: tenant room + every participant's token room (waiting, serving, recent)
-  const participants = await db.queueEntry.findMany({
-    where: { queueId: queue.id },
-    include: { appointment: true },
-  })
-  const rooms = [`t:${tenant.id}`, ...participants.map((f) => `q:${f.appointment.liveToken}`)]
-  const fresh = participants.filter((f) => f.status === 'WAITING')
-  const currentQueue = await db.queue.findUnique({ where: { id: queue.id } })
-  const servingCode = currentQueue?.currentServing
-
-  let staffN = 1
-  let perPerson = 15
-  if (fresh.length > 0) {
-    staffN = await activeStaffCount(queue.branchId, queue.serviceId)
-    perPerson = Math.max(5, Math.round((currentQueue?.avgServiceMin || 15) / staffN))
+  await recalculate(tx, queue.id)
+  return {
+    ok: true, jobs, tenantId: tenant.id, tenantName: tenant.name, branchName: queue.branch.name, serviceName: queue.service.name,
+    sendCancelSms, targetEntryId, callEvent,
   }
+}
 
-  for (const f of fresh) {
-    const peopleAhead = fresh.filter((x) => x.position < f.position).length
-    await broadcastQueueUpdate(tenant.id, f.appointment.liveToken, {
-      queueId: queue.id,
-      event: 'queue.updated',
-      position: peopleAhead + 1,
-      peopleAhead,
-      estimatedWait: peopleAhead * perPerson,
+async function sendJobs(o: Extract<ActionOutcome, { ok: true }>) {
+  for (const j of o.jobs) {
+    if (j.type === 'CANCELLED' && !o.sendCancelSms) continue
+    await queueNotification({
+      tenantId: o.tenantId,
+      appointmentId: j.appointmentId,
+      type: j.type,
+      recipient: j.mobile,
+      vars: buildTemplateVars({
+        customerName: j.customerName, businessName: o.tenantName, branchName: o.branchName, serviceName: o.serviceName,
+        appointmentCode: j.code, scheduledAt: j.scheduledAt, liveToken: j.liveToken, queue: null,
+      }),
+      material: true,
     })
   }
-  // notify the directly-affected entry rooms (called / skipped / completed …)
-  const affected = participants.find((p) => p.id === args.entryId) || participants.find((p) => p.appointment.code === servingCode)
-  if (affected) {
-    await broadcastQueueUpdate(tenant.id, affected.appointment.liveToken, {
-      queueId: queue.id,
-      event: args.action === 'call' || args.action === 'next' ? 'appointment.called' : 'queue.updated',
-      position: 0,
-      peopleAhead: 0,
-      estimatedWait: 0,
+}
+
+/**
+ * Heads-up SMS, at most once per day per customer and type:
+ *  - first eligible customer  → YOUR_TURN
+ *  - second eligible customer → QUEUE_CHANGED
+ * The old code re-sent a QUEUE_CHANGED SMS to the two closest customers after EVERY queue
+ * action (spam), and also texted people whose appointment was hours away.
+ */
+async function notifyUpcoming(queueId: string, tenant: { id: string; name: string }) {
+  const queue = await db.queue.findUnique({ where: { id: queueId }, include: { branch: true, service: true } })
+  if (!queue || queue.status === 'PAUSED') return
+  const waiting = await db.queueEntry.findMany({
+    where: { queueId, status: 'WAITING' },
+    orderBy: { position: 'asc' },
+    include: { appointment: { include: { customer: true } } },
+  })
+  const busy = (await db.queueEntry.count({ where: { queueId, status: { in: ['CALLED', 'IN_SERVICE'] } } })) > 0
+  const now = new Date()
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const eligible = waiting.filter((e) => isEligibleForAutoCall(e, now)).slice(0, 2)
+  for (let i = 0; i < eligible.length; i++) {
+    const e = eligible[i]
+    const type: NotificationType = i === 0 ? 'YOUR_TURN' : 'QUEUE_CHANGED'
+    const already = await db.notification.findFirst({
+      where: { appointmentId: e.appointmentId, type, createdAt: { gte: startOfDay } },
+      select: { id: true },
+    })
+    if (already) continue
+    const peopleAhead = waiting.filter((x) => x.position < e.position).length
+    await queueNotification({
+      tenantId: tenant.id,
+      appointmentId: e.appointmentId,
+      type,
+      recipient: e.appointment.customer.mobile,
+      vars: buildTemplateVars({
+        customerName: e.appointment.customer.name, businessName: tenant.name, branchName: queue.branch.name,
+        serviceName: queue.service.name, appointmentCode: e.appointment.code, scheduledAt: e.appointment.scheduledAt,
+        liveToken: e.appointment.liveToken,
+        queue: { position: e.position, peopleAhead, estimatedWait: estimateWait(peopleAhead, queue.avgServiceMin, busy) },
+      }),
+      material: true,
     })
   }
-  await broadcast(rooms, 'queue.activity', {
-    queueId: queue.id,
-    servingCode,
-    action: args.action,
-    at: now.toISOString(),
-  })
+}
 
-  // threshold policy → notify the 2 closest bookers after material changes
-  if (['next', 'call', 'skip', 'cancel', 'no_show', 'move'].includes(args.action)) {
-    await notifyWaiting(queue.id, tenant.id)
+/** Push fresh state to the business panel and to every participant's live page. */
+export async function broadcastQueueState(queueId: string, opts: { targetEntryId?: string; callEvent?: boolean; action?: string } = {}) {
+  const queue = await db.queue.findUnique({ where: { id: queueId } })
+  if (!queue) return
+  const [state, participants] = await Promise.all([
+    getLiveState(queueId),
+    db.queueEntry.findMany({ where: { queueId }, include: { appointment: { select: { liveToken: true } } } }),
+  ])
+  if (!state) return
+  const now = new Date().toISOString()
+  const jobs: Promise<void>[] = []
+  for (const w of state.waiting) {
+    jobs.push(broadcastQueueUpdate(queue.tenantId, w.token, {
+      queueId, event: 'queue.updated', position: w.peopleAhead + 1, peopleAhead: w.peopleAhead, estimatedWait: w.estimatedWait,
+    }))
   }
+  const target = opts.targetEntryId ? participants.find((p) => p.id === opts.targetEntryId) : undefined
+  if (target) {
+    jobs.push(broadcastQueueUpdate(queue.tenantId, target.appointment.liveToken, {
+      queueId, event: opts.callEvent ? 'appointment.called' : 'queue.updated', position: 0, peopleAhead: 0, estimatedWait: 0,
+    }))
+  }
+  jobs.push(broadcast(
+    [`t:${queue.tenantId}`, ...participants.map((p) => `q:${p.appointment.liveToken}`)],
+    'queue.activity',
+    { queueId, servingCode: queue.currentServing, action: opts.action ?? 'update', at: now },
+  ))
+  await Promise.all(jobs)
+}
 
+/** Execute a queue action atomically (see header). */
+export async function executeQueueAction(args: ActionArgs): Promise<{ ok: boolean; error?: string; snapshot?: QueueSnapshot }> {
+  let outcome: ActionOutcome
+  try {
+    outcome = await db.$transaction((tx) => runAction(tx, args), TX_OPTS)
+  } catch (e) {
+    console.error('queue action failed', e)
+    return { ok: false, error: 'خطا در اجرای عملیات؛ دوباره تلاش کنید' }
+  }
+  if (!outcome.ok) return { ok: false, error: outcome.error }
+
+  // ── post-commit side effects: failures here never undo the queue change ──
+  try {
+    await sendJobs(outcome)
+    await broadcastQueueState(args.queueId, { targetEntryId: outcome.targetEntryId, callEvent: outcome.callEvent, action: args.action })
+    if (['next', 'call', 'skip', 'cancel', 'no_show', 'complete', 'move', 'requeue'].includes(args.action)) {
+      await notifyUpcoming(args.queueId, { id: outcome.tenantId, name: outcome.tenantName })
+    }
+  } catch (e) {
+    console.error('queue side effects failed', e)
+  }
+  const snapshot = await getLiveState(args.queueId)
   return { ok: true, snapshot: snapshot || undefined }
+}
+
+/**
+ * Cancel an appointment through the one correct path (used by the business panel and by the
+ * customer's own "cancel" button): updates entry + appointment, frees the "now serving" slot,
+ * re-indexes positions, notifies and broadcasts.
+ */
+export async function cancelAppointment(args: {
+  appointmentId: string
+  actor: string
+  reason?: string
+  bypassReason?: boolean
+}): Promise<{ ok: boolean; error?: string }> {
+  const entry = await db.queueEntry.findUnique({ where: { appointmentId: args.appointmentId } })
+  if (entry) {
+    const r = await executeQueueAction({
+      queueId: entry.queueId, action: 'cancel', entryId: entry.id, actor: args.actor, reason: args.reason, bypassReason: args.bypassReason,
+    })
+    return { ok: r.ok, error: r.error }
+  }
+  // appointment without a queue entry (legacy data): plain status change
+  await db.appointment.update({ where: { id: args.appointmentId }, data: { status: 'CANCELLED' } })
+  return { ok: true }
+}
+
+/** Customer arrived: make sure they are in the queue and flagged as present. */
+export async function checkInAppointment(appointmentId: string): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await tx.appointment.update({ where: { id: appointmentId }, data: { status: 'WAITING' } })
+    // skipped / no-show latecomers go to the back; everyone else keeps their slot-based place
+    const entry = await tx.queueEntry.findUnique({ where: { appointmentId } })
+    const late = !!entry && (entry.status === 'SKIPPED' || entry.status === 'NO_SHOW')
+    await enqueueInner(tx, appointmentId, { atEnd: late })
+  }, TX_OPTS)
 }
 
 /** Add a walk-in / in-person booking straight into the queue (Business panel). */
@@ -575,39 +652,40 @@ export async function createWalkIn(args: {
   priority?: string
   actor: string
 }): Promise<{ ok: boolean; error?: string; token?: string; code?: string }> {
-  const service = await db.service.findUnique({ where: { id: args.serviceId } })
-  const branch = await db.branch.findUnique({ where: { id: args.branchId } })
-  const tenant = await db.tenant.findUnique({ where: { id: args.tenantId } })
-  if (!service || !branch || !tenant) return { ok: false, error: 'اطلاعات ناقص' }
-
-  const now = new Date()
-  const count = await db.appointment.count({ where: { tenantId: args.tenantId } })
-  const code = `${branch.name ? 'W' : 'W'}-${String(count + 1).padStart(3, '0')}-${Math.floor(Math.random() * 90 + 10)}`
-  const customer = await db.customer.upsert({
-    where: { tenantId_mobile: { tenantId: args.tenantId, mobile: args.mobile } },
-    update: { name: args.customerName },
-    create: { tenantId: args.tenantId, name: args.customerName, mobile: args.mobile },
-  })
-  const appt = await db.appointment.create({
-    data: {
-      tenantId: args.tenantId,
-      branchId: args.branchId,
-      serviceId: args.serviceId,
-      staffId: args.staffId || null,
-      customerId: customer.id,
-      code,
-      scheduledAt: now,
-      durationMin: service.duration,
-      status: 'WAITING',
-      source: 'WALK_IN',
-      priority: args.priority || 'NORMAL',
-      liveToken: crypto.randomUUID().replace(/-/g, ''),
-    },
-  })
-  await enqueueAppointment(appt.id)
-  await audit({
-    tenantId: args.tenantId, actor: args.actor, action: 'APPOINTMENT_WALK_IN',
-    entityType: 'Appointment', entityId: appt.id, detail: { code },
-  })
-  return { ok: true, token: appt.liveToken, code }
+  const priority = args.priority && args.priority in PRIORITY_RANK ? args.priority : 'NORMAL'
+  try {
+    const created = await db.$transaction(async (tx) => {
+      const [service, branch, tenant] = await Promise.all([
+        tx.service.findUnique({ where: { id: args.serviceId } }),
+        tx.branch.findUnique({ where: { id: args.branchId } }),
+        tx.tenant.findUnique({ where: { id: args.tenantId } }),
+      ])
+      if (!service || !branch || !tenant) return null
+      const now = new Date()
+      const code = await generateUniqueCode(tx, 'W')
+      const customer = await tx.customer.upsert({
+        where: { tenantId_mobile: { tenantId: args.tenantId, mobile: args.mobile } },
+        update: { name: args.customerName },
+        create: { tenantId: args.tenantId, name: args.customerName, mobile: args.mobile },
+      })
+      const appt = await tx.appointment.create({
+        data: {
+          tenantId: args.tenantId, branchId: args.branchId, serviceId: args.serviceId, staffId: args.staffId || null,
+          customerId: customer.id, code, scheduledAt: now, durationMin: service.duration,
+          status: 'WAITING', source: 'WALK_IN', priority, liveToken: crypto.randomUUID().replace(/-/g, ''),
+        },
+      })
+      const q = await enqueueInner(tx, appt.id, {})
+      await tx.auditLog.create({
+        data: { tenantId: args.tenantId, actor: args.actor, action: 'APPOINTMENT_WALK_IN', entityType: 'Appointment', entityId: appt.id, detail: JSON.stringify({ code }) },
+      })
+      return { token: appt.liveToken, code, queueId: q?.queueId }
+    }, TX_OPTS)
+    if (!created) return { ok: false, error: 'اطلاعات ناقص' }
+    if (created.queueId) await broadcastQueueState(created.queueId, { action: 'WALK_IN' }).catch(() => {})
+    return { ok: true, token: created.token, code: created.code }
+  } catch (e) {
+    console.error('walk-in failed', e)
+    return { ok: false, error: 'خطا در ثبت نوبت حضوری' }
+  }
 }

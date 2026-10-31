@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { requireBusinessSession } from '@/lib/auth'
+import { requireBusinessSession, requireManagerSession } from '@/lib/auth'
 
 export async function GET(req: Request) {
   const session = await requireBusinessSession()
@@ -22,7 +22,7 @@ export async function GET(req: Request) {
 }
 
 export async function DELETE(req: Request) {
-  const session = await requireBusinessSession()
+  const session = await requireManagerSession()
   if (!session?.tenantId) return NextResponse.json({ error: 'دسترسی غیرمجاز' }, { status: 403 })
   const url = new URL(req.url)
   const id = url.searchParams.get('id')

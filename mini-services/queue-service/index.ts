@@ -1,5 +1,6 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
+import { createHmac, timingSafeEqual } from 'crypto'
 
 /**
  * Queue Real-Time Service (PRD §9, §37)
@@ -25,16 +26,37 @@ import { Server } from 'socket.io'
  * to push broadcast events. Kept separate because the socket.io server
  * owns every request on its port (path '/').
  */
-const internal = createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+// Shared secret between the Next.js API and this service (set the same value on both sides).
+const BROADCAST_SECRET = process.env.BROADCAST_SECRET || ''
+// Secret used to verify tenant-room join tokens signed by the Next.js API (same as its SESSION_SECRET).
+const SESSION_SECRET = process.env.SESSION_SECRET || ''
+if (!BROADCAST_SECRET) console.warn('[queue-service] BROADCAST_SECRET is not set — /broadcast is unauthenticated (localhost-only).')
+if (!SESSION_SECRET) console.warn('[queue-service] SESSION_SECRET is not set — tenant rooms cannot be joined.')
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204)
-    res.end()
-    return
+function safeEq(a: string, b: string): boolean {
+  const x = Buffer.from(a), y = Buffer.from(b)
+  return x.length === y.length && timingSafeEqual(x, y)
+}
+
+/** Verify a token issued by createSocketToken() in src/lib/auth.ts → tenantId, or null. */
+function verifyTenantToken(token: string, tenantId: string): boolean {
+  if (!SESSION_SECRET || !token) return false
+  const dot = token.lastIndexOf('.')
+  if (dot < 0) return false
+  const body = token.slice(0, dot)
+  const sig = token.slice(dot + 1)
+  const expected = createHmac('sha256', SESSION_SECRET).update('socket:' + body).digest('base64url')
+  if (!safeEq(sig, expected)) return false
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as { tid?: string; exp?: number }
+    return p.tid === tenantId && typeof p.exp === 'number' && p.exp > Date.now()
+  } catch {
+    return false
   }
+}
+
+// Internal API: no CORS headers at all — it is called server-to-server only, never from a browser.
+const internal = createServer((req, res) => {
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -43,8 +65,16 @@ const internal = createServer((req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/broadcast') {
+    if (BROADCAST_SECRET && !safeEq(String(req.headers['x-internal-token'] || ''), BROADCAST_SECRET)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }))
+      return
+    }
     let body = ''
-    req.on('data', (chunk) => (body += chunk))
+    req.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 256 * 1024) req.destroy() // payload cap
+    })
     req.on('end', () => {
       try {
         const { rooms, event, data } = JSON.parse(body || '{}')
@@ -53,12 +83,14 @@ const internal = createServer((req, res) => {
           res.end(JSON.stringify({ ok: false, error: 'event is required' }))
           return
         }
-        const target = Array.isArray(rooms) ? rooms : []
+        // never fall back to emitting to every connected socket (would leak events across tenants)
+        const target = (Array.isArray(rooms) ? rooms : []).filter((r): r is string => typeof r === 'string' && ROOM_RE.test(r))
         if (target.length === 0) {
-          io.emit(event, data)
-        } else {
-          for (const room of target) io.to(room).emit(event, data)
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: 'rooms are required' }))
+          return
         }
+        for (const room of target) io.to(room).emit(event, data)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, rooms: target, event }))
       } catch (e) {
@@ -79,7 +111,8 @@ const io = new Server(httpServer, {
   // DO NOT change the path, it is used by Caddy to forward the request to the correct port
   path: '/',
   cors: {
-    origin: '*',
+    // same-origin through the gateway; set ALLOWED_ORIGIN when the site is served from another origin
+    origin: process.env.ALLOWED_ORIGIN || false,
     methods: ['GET', 'POST'],
   },
   pingTimeout: 60000,
@@ -104,12 +137,14 @@ io.on('connection', (socket) => {
     if (/^[a-f0-9]{16,64}$/i.test(token)) socket.leave(`q:${token}`)
   })
 
-  socket.on('watch', (data: { tenantId?: string }) => {
+  socket.on('watch', (data: { tenantId?: string; token?: string }) => {
     const tenantId = (data?.tenantId || '').trim()
-    if (/^[a-z0-9]{6,40}$/i.test(tenantId)) {
-      socket.join(`t:${tenantId}`)
-      socket.emit('watching', { ok: true, room: `t:${tenantId}` })
+    if (!/^[a-z0-9]{6,40}$/i.test(tenantId) || !verifyTenantToken(String(data?.token || ''), tenantId)) {
+      socket.emit('watching', { ok: false, error: 'unauthorized' })
+      return
     }
+    socket.join(`t:${tenantId}`)
+    socket.emit('watching', { ok: true, room: `t:${tenantId}` })
   })
 
   socket.on('ping-room', (data: { room?: string }) => {
@@ -129,7 +164,8 @@ httpServer.listen(PORT, () => {
   console.log(`Queue real-time service (socket.io) running on port ${PORT}`)
 })
 
-internal.listen(INTERNAL_PORT, () => {
+// internal API listens on loopback only
+internal.listen(INTERNAL_PORT, '127.0.0.1', () => {
   console.log(`Queue internal broadcast API running on port ${INTERNAL_PORT}`)
 })
 
